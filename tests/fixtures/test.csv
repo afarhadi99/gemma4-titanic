@@ -1,0 +1,11 @@
+PassengerId,Pclass,Name,Sex,Age,SibSp,Parch,Ticket,Fare,Cabin,Embarked
+892,3,"Kelly, Mr. James",male,34.5,0,0,330911,7.8292,,Q
+893,3,"Wilkes, Mrs. James (Ellen Needs)",female,47,1,0,363272,7,,S
+894,2,"Myles, Mr. Thomas Francis",male,62,0,0,240276,9.6875,,Q
+895,3,"Wirz, Mr. Albert",male,,0,0,315154,8.6625,,S
+896,1,"Dupont, Mme. Marie",female,40,0,0,PC 17601,83.1583,C54,C
+897,3,"Svensson, Master. Johan",male,8,0,1,7538,9.225,,S
+898,3,"Andersson, Miss. Sigrid Elisabeth",female,11,4,2,347082,31.275,,S
+899,1,"Brown, Dr. Edward",male,26,1,1,248738,29,B20,S
+900,3,"Storey, Mr. Thomas",male,60.5,0,0,3701,,,S
+901,3,"Davies, Mr. John Samuel",male,21,2,0,A/4 48871,24.15,,S

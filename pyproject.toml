@@ -1,0 +1,27 @@
+[project]
+name = "gemma4-titanic"
+version = "0.1.0"
+description = "Kaggle Titanic: classical baseline plus Gemma 4 LoRA fine-tuned on Modal"
+requires-python = ">=3.11"
+dependencies = [
+    "modal==1.6.4",
+    "kaggle",
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "six>=1.17.0",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/titanic"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "src"]

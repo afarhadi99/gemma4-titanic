@@ -1,0 +1,10 @@
+data/
+outputs/
+submissions/
+.venv/
+__pycache__/
+*.pyc
+kaggle.json
+.env
+*.zip
+.pytest_cache/
