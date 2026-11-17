@@ -4,8 +4,10 @@ Each passenger is described in English; the model answers "yes"/"no" and the
 prediction is the softmax over those two label-token logits. K-fold training gives
 out-of-fold (OOF) probabilities plus K test predictions that are averaged.
 
-One-time setup (bash; in Codespaces Modal auth comes from MODAL_TOKEN_ID/MODAL_TOKEN_SECRET):
-    modal secret create huggingface-secret HF_TOKEN=hf_xxx
+Configuration comes from a single .env file in the repo root (see .env.example):
+MODAL_TOKEN_ID / MODAL_TOKEN_SECRET authenticate the local Modal client and HF_TOKEN is
+forwarded to the GPU containers. Optional defaults: GEMMA_MODEL_ID, MODAL_GPU, FOLDS,
+EPOCHS, LR, SEED. Command-line flags override them.
 
 Usage (run from the repo root, data in ./data):
     uv run modal run modal_app.py --smoke
@@ -21,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -29,11 +32,20 @@ import modal
 import numpy as np
 import pandas as pd
 
+from titanic.env import load_env
+
+if modal.is_local():
+    load_env()
+
 APP_NAME = "titanic-gemma4"
 HF_HOME = "/root/.cache/huggingface"
 RUNS_DIR = "/runs"
-DEFAULT_MODEL_ID = "google/gemma-4-E2B-it"
-DEFAULT_GPU = "L40S"
+DEFAULT_MODEL_ID = os.environ.get("GEMMA_MODEL_ID") or "google/gemma-4-E2B-it"
+DEFAULT_GPU = os.environ.get("MODAL_GPU") or "L40S"
+DEFAULT_FOLDS = int(os.environ.get("FOLDS") or 5)
+DEFAULT_EPOCHS = int(os.environ.get("EPOCHS") or 3)
+DEFAULT_LR = float(os.environ.get("LR") or 1e-4)
+DEFAULT_SEED = int(os.environ.get("SEED") or 42)
 SMOKE_ROWS = 64
 SMOKE_FOLDS = 2
 SMOKE_MAX_STEPS = 10
@@ -57,6 +69,7 @@ image = (
 
 hf_volume = modal.Volume.from_name("hf-cache", create_if_missing=True)
 runs_volume = modal.Volume.from_name("titanic-gemma4-runs", create_if_missing=True)
+hf_secret = modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
 
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +222,7 @@ def make_cfg(
 @app.function(
     image=image,
     volumes={HF_HOME: hf_volume},
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[hf_secret],
     timeout=30 * 60,
 )
 def prefetch_model(model_id: str) -> str:
@@ -226,14 +239,13 @@ def prefetch_model(model_id: str) -> str:
     gpu=DEFAULT_GPU,
     timeout=60 * 60,
     volumes={HF_HOME: hf_volume, RUNS_DIR: runs_volume},
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[hf_secret],
 )
 def train_fold(
     train_csv: str, test_csv: str, fold: int, folds: int, seed: int, cfg: dict
 ) -> dict:
     """Train one LoRA fold (fold=-1 trains on all rows) and score val + test rows."""
     import inspect
-    import os
 
     import torch
     import transformers
@@ -247,7 +259,7 @@ def train_fold(
 
     hf_volume.reload()
     if not os.environ.get("HF_TOKEN"):
-        print("WARNING: HF_TOKEN not set in huggingface-secret; continuing without it")
+        print("WARNING: HF_TOKEN is empty (set it in .env); continuing without it")
     transformers.set_seed(seed + max(fold, 0))
     train_raw = pd.read_csv(io.StringIO(train_csv))
     test_raw = pd.read_csv(io.StringIO(test_csv))
@@ -412,13 +424,13 @@ def train_fold(
 def main(
     data_dir: str = "data",
     model_id: str = DEFAULT_MODEL_ID,
-    folds: int = 5,
-    epochs: int = 3,
-    lr: float = 1e-4,
+    folds: int = DEFAULT_FOLDS,
+    epochs: int = DEFAULT_EPOCHS,
+    lr: float = DEFAULT_LR,
     gpu: str = DEFAULT_GPU,
     run_name: str = "",
     smoke: bool = False,
-    seed: int = 42,
+    seed: int = DEFAULT_SEED,
 ):
     start = time.time()
     data_path = Path(data_dir)

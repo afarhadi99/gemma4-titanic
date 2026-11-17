@@ -1,14 +1,14 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
+. (Join-Path $PSScriptRoot "load_env.ps1")
+Import-DotEnv
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv not found. Install it from https://docs.astral.sh/uv/ (kaggle runs via 'uv run kaggle'; alternatively 'uv tool install kaggle')."
 }
 
-$hasAuth = $env:KAGGLE_API_TOKEN -or ($env:KAGGLE_USERNAME -and $env:KAGGLE_KEY) -or
-    (Test-Path "$HOME/.kaggle/kaggle.json") -or (Test-Path "$HOME/.kaggle/access_token")
-if (-not $hasAuth) {
-    throw "No Kaggle credentials. Set KAGGLE_API_TOKEN (or KAGGLE_USERNAME + KAGGLE_KEY) or create ~/.kaggle/access_token."
+if (-not ($env:KAGGLE_API_TOKEN -or ($env:KAGGLE_USERNAME -and $env:KAGGLE_KEY))) {
+    throw "No Kaggle credentials in .env. Set KAGGLE_API_TOKEN (or KAGGLE_USERNAME + KAGGLE_KEY)."
 }
 
 New-Item -ItemType Directory -Force data | Out-Null

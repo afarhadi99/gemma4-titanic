@@ -7,23 +7,5 @@
     "vscode": {
       "extensions": ["ms-python.python", "ms-toolsai.jupyter"]
     }
-  },
-  "secrets": {
-    "MODAL_TOKEN_ID": {
-      "description": "Modal token ID (create a token in the Modal dashboard).",
-      "documentationUrl": "https://modal.com/settings/tokens"
-    },
-    "MODAL_TOKEN_SECRET": {
-      "description": "Modal token secret paired with MODAL_TOKEN_ID.",
-      "documentationUrl": "https://modal.com/settings/tokens"
-    },
-    "HF_TOKEN": {
-      "description": "Hugging Face read token; your account must have accepted the Gemma license.",
-      "documentationUrl": "https://huggingface.co/settings/tokens"
-    },
-    "KAGGLE_API_TOKEN": {
-      "description": "Kaggle API token (Settings > API > Create New Token).",
-      "documentationUrl": "https://www.kaggle.com/settings"
-    }
   }
 }

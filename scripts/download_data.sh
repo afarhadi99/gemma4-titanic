@@ -3,15 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-has_auth=0
-[[ -n "${KAGGLE_API_TOKEN:-}" ]] && has_auth=1
-[[ -n "${KAGGLE_USERNAME:-}" && -n "${KAGGLE_KEY:-}" ]] && has_auth=1
-[[ -f "$HOME/.kaggle/kaggle.json" || -f "$HOME/.kaggle/access_token" ]] && has_auth=1
+if [[ ! -f .env ]]; then
+  echo "error: no .env found. Run: cp .env.example .env and fill it in." >&2
+  exit 1
+fi
+set -a
+. ./.env
+set +a
 
-if [[ $has_auth -eq 0 ]]; then
-  echo "error: no Kaggle credentials found." >&2
-  echo "Set the Codespaces secret KAGGLE_API_TOKEN (or legacy KAGGLE_USERNAME + KAGGLE_KEY)," >&2
-  echo "or create ~/.kaggle/access_token / ~/.kaggle/kaggle.json." >&2
+if [[ -z "${KAGGLE_API_TOKEN:-}" && ( -z "${KAGGLE_USERNAME:-}" || -z "${KAGGLE_KEY:-}" ) ]]; then
+  echo "error: no Kaggle credentials in .env. Set KAGGLE_API_TOKEN (or KAGGLE_USERNAME + KAGGLE_KEY)." >&2
   exit 1
 fi
 

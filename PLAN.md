@@ -7,11 +7,16 @@ Data: `train.csv` (891 rows, labelled), `test.csv` (418), `gender_submission.csv
 ## Where it runs
 
 Primary dev environment: **GitHub Codespaces** (Linux, bash, Python 3.12 devcontainer). The
-codespace only orchestrates — all GPU work runs on Modal. Credentials arrive as Codespaces
-secrets → env vars: `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` (read by the Modal CLI directly),
-`HF_TOKEN` (copied into the Modal secret `huggingface-secret` by `scripts/setup_secrets.sh`),
-`KAGGLE_API_TOKEN` (or legacy `KAGGLE_USERNAME` + `KAGGLE_KEY`). Bash scripts and a `Makefile`
-are the primary interface; `.ps1` scripts remain for local Windows use.
+codespace only orchestrates — all GPU work runs on Modal. All configuration comes from **one
+`.env` file** in the repo root (copied from the committed `.env.example` by the post-create
+script; gitignored, never committed): `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` (read lazily by the
+Modal client), `HF_TOKEN` (forwarded to containers via `modal.Secret.from_dict`, the only value
+that leaves the machine), `KAGGLE_API_TOKEN` (or `KAGGLE_USERNAME` + `KAGGLE_KEY`), plus optional
+training defaults (`GEMMA_MODEL_ID`, `MODAL_GPU`, `FOLDS`, `EPOCHS`, `LR`, `SEED`). No Codespaces
+secrets, no Modal named secret, no `~/.kaggle` files. `modal_app.py` loads `.env` itself via
+`titanic.env.load_env`; the Makefile and scripts also load it (`uv run --env-file .env`,
+`set -a; . ./.env`). `make check` verifies keys and Modal/Kaggle auth. Bash scripts and a
+`Makefile` are the primary interface; `.ps1` scripts remain for local Windows use.
 
 ## Strategy
 
@@ -42,7 +47,7 @@ boosting here, so the repo does three things and lets out-of-fold (OOF) accuracy
 - Library floors: transformers ≥ 5.5.2, peft ≥ 0.19.0 (needs torch ≥ 2.7), accelerate ≥ 1.12.
 - Modal SDK 1.6.4. `modal.Image.debian_slim(python_version="3.12").uv_pip_install(...)`,
   `.add_local_python_source("titanic")`, `modal.Volume.from_name(..., create_if_missing=True)`,
-  `vol.commit()`, `modal.Secret.from_name("huggingface-secret")`, `Function.with_options(gpu=...)`.
+  `vol.commit()`, `modal.Secret.from_dict({"HF_TOKEN": ...})`, `Function.with_options(gpu=...)`.
   $30/month free credit. Default GPU **L40S** (48 GB, ≈ $1.95/h); E2B bf16 LoRA fits easily.
 - Kaggle CLI (current): competition is positional — `kaggle competitions download titanic`,
   `kaggle competitions submit titanic -f FILE -m MSG`. Must click "Join Competition" first.
@@ -53,7 +58,9 @@ boosting here, so the repo does three things and lets out-of-fold (OOF) accuracy
 README.md                    step-by-step directions                       (docs pass)
 PLAN.md                      this file                                     (Opus)
 pyproject.toml               uv project, local deps                        (Agent A)
-.gitignore                   data/, outputs/, submissions/, .venv, kaggle.json, .env (Agent A)
+.gitignore                   data/, outputs/, submissions/, .venv, .env    (Agent A)
+.env.example                 template for the single .env config file      (Agent A)
+src/titanic/env.py           dependency-free .env loader                   (Agent A)
 src/titanic/__init__.py                                                    (Agent A)
 src/titanic/features.py      load + feature engineering                    (Agent A)
 src/titanic/text.py          row → prompt text, prompt constants           (Agent A)
@@ -64,9 +71,9 @@ ensemble.py                  blend outputs/*/ → submissions/submission.csv (Ag
 modal_app.py                 Modal training + inference                    (Agent B)
 scripts/download_data.sh    kaggle download + unzip into data/ (+ .ps1)   (Agent A)
 scripts/submit.sh            validate + kaggle submit (+ .ps1)             (Agent A)
-scripts/setup_secrets.sh     check Modal/Kaggle auth, create HF Modal secret (Agent A)
+scripts/check_env.sh         check .env keys and Modal/Kaggle auth         (Agent A)
 .devcontainer/               Codespaces: devcontainer.json + post-create.sh (Agent A)
-Makefile                     setup/secrets/data/test/baseline/smoke/train/ensemble/submit (Agent A)
+Makefile                     setup/env/check/data/test/baseline/smoke/train/ensemble/submit (Agent A)
 .gitattributes               LF endings for *.sh and Makefile              (Agent A)
 tests/test_features.py, test_text.py, test_submission.py, test_ensemble.py (Agent A)
 tests/test_lora.py                                                         (Agent B)
@@ -118,7 +125,7 @@ Run artifacts — every model writes to `outputs/<run_name>/`:
   torch≥2.7 (CUDA build), transformers≥5.5.2,<6, peft≥0.19.0, accelerate≥1.12, pandas,
   scikit-learn, numpy; `.add_local_python_source("titanic")`.
 - Volumes: `hf-cache` at `/root/.cache/huggingface` (weights persist across runs),
-  `titanic-gemma4-runs` at `/runs`. Secret: `huggingface-secret` (`HF_TOKEN`).
+  `titanic-gemma4-runs` at `/runs`. Secret: `modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})`.
 - Data is read locally by the entrypoint and passed as CSV text arguments (tiny), so no upload step.
 - `train_fold(train_csv, test_csv, fold, folds, seed, cfg) -> dict` (GPU fn): engineer
   features, split with `StratifiedKFold(folds, shuffle=True, random_state=seed)` (fold = -1
@@ -133,8 +140,9 @@ Run artifacts — every model writes to `outputs/<run_name>/`:
   pass per batch, logits at the last prompt position, softmax over the two label token ids.
   Returns `{"fold", "val_ids", "val_probs", "test_ids", "test_probs", "val_accuracy"}` and saves the
   adapter to `/runs/<run_name>/fold<k>/` then `vol.commit()`.
-- `@app.local_entrypoint() main(data_dir="data", model_id="google/gemma-4-E2B-it", folds=5,
-  epochs=3, lr=1e-4, gpu="L40S", run_name=None, smoke=False, seed=42)`: reads CSVs, fans out
+- `@app.local_entrypoint() main(data_dir="data", model_id, folds, epochs, lr, gpu, run_name,
+  smoke=False, seed)`: defaults come from `GEMMA_MODEL_ID` (google/gemma-4-E2B-it), `FOLDS` (5),
+  `EPOCHS` (3), `LR` (1e-4), `MODAL_GPU` (L40S), `SEED` (42), overridable by CLI flags; reads CSVs, fans out
   folds in parallel with `train_fold.with_options(gpu=gpu).starmap(...)` / `.map`, assembles
   OOF + averaged test probs, writes `outputs/<run_name>/{oof.csv,test_probs.csv,metrics.json}`
   locally, prints OOF accuracy. `smoke=True`: 64 train rows, 2 folds, 1 epoch, ≤ 10 steps —

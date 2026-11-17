@@ -8,37 +8,33 @@ Kaggle [Titanic](https://www.kaggle.com/c/titanic) with a classical baseline and
 
 Design details are in [PLAN.md](PLAN.md).
 
-## Before you start
+## Step 1: open the codespace
 
-- [ ] **Kaggle**: account, then open https://www.kaggle.com/c/titanic and click **Join Competition** (accept the rules).
-- [ ] **Kaggle API token**: kaggle.com > Settings > API > Create New Token.
-- [ ] **Modal**: account at https://modal.com ($30/month free credit) and a token (`modal token new` locally, or modal.com > Settings > API Tokens). This gives you `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
-- [ ] **Hugging Face**: account and a read token at https://huggingface.co/settings/tokens. Open https://huggingface.co/google/gemma-4-E2B-it and accept the license if prompted.
+Code > Codespaces > **Create codespace on main** (or clone the repo locally and run `bash .devcontainer/post-create.sh`, i.e. `make setup`). The post-create script installs uv, runs `uv sync`, activates the venv in new shells and creates `.env` from `.env.example` if it is missing. It then prints which keys in `.env` are `set` or `missing` (never the values).
 
-## Step 1: add Codespaces secrets
+## Step 2: fill in `.env`
 
-GitHub > Settings > Codespaces > Secrets (or repo-level), and give this repo access to each:
+All configuration lives in one file, `.env` in the repo root. Open it and fill in:
 
-| Secret | Value |
+| Variable | Where to get it |
 | --- | --- |
-| `MODAL_TOKEN_ID` | Modal token ID |
-| `MODAL_TOKEN_SECRET` | Modal token secret |
-| `HF_TOKEN` | Hugging Face read token |
-| `KAGGLE_API_TOKEN` | Kaggle API token (alternative: `KAGGLE_USERNAME` + `KAGGLE_KEY`) |
+| `KAGGLE_API_TOKEN` | kaggle.com > Settings > API > **Create New Token**. Alternative: `KAGGLE_USERNAME` + `KAGGLE_KEY`. Also open https://www.kaggle.com/c/titanic and click **Join Competition** (accept the rules). |
+| `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | Modal dashboard > Settings > API Tokens (account at https://modal.com, $30/month free credit). |
+| `HF_TOKEN` | Read token from https://huggingface.co/settings/tokens. Open https://huggingface.co/google/gemma-4-E2B-it and accept the license. |
 
-Secrets added after a codespace exists only appear after you restart the codespace.
+`HF_TOKEN` is the only value forwarded to the Modal GPU containers. The Modal and Kaggle tokens stay on the machine running `make`.
 
-## Step 2: create the codespace
+**Warning:** `.env` holds live tokens. It is gitignored: never commit it or paste it anywhere. It exists only in this codespace (or on your machine), so deleting the codespace deletes it.
 
-Code > Codespaces > **Create codespace on main**. The post-create script installs uv, runs `uv sync`, activates the venv in new shells and lists which secrets are set (never their values). Success: the terminal shows `MODAL_TOKEN_ID: set` and so on, with nothing `missing`.
+The commented-out "training defaults" block in `.env.example` (`GEMMA_MODEL_ID`, `MODAL_GPU`, `FOLDS`, `EPOCHS`, `LR`, `SEED`) sets the defaults for `make smoke` / `make train`. Uncomment a line to change it; command-line flags still override it.
 
-## Step 3: connect Modal and Kaggle
+## Step 3: check the setup
 
 ```bash
-make secrets
+make check
 ```
 
-Checks Modal auth, creates or updates the Modal secret `huggingface-secret` from `$HF_TOKEN`, and checks Kaggle auth. Success: `Modal: ok`, `huggingface-secret: created/updated`, `Kaggle: ok`.
+Prints `set`/`missing` for each key, then verifies Modal and Kaggle auth. Success: `Modal: ok` and `Kaggle: ok`. Every error points back at `.env`.
 
 ## Step 4: download the data
 
@@ -78,10 +74,10 @@ The smoke output is marked `"smoke": true` and `make ensemble` skips it automati
 make train
 ```
 
-5 folds in parallel on an L40S, about 10-20 minutes and roughly $1-3. Writes `outputs/gemma4-<model>-<timestamp>/{oof.csv,test_probs.csv,metrics.json}` and prints fold and OOF accuracy. To override the model, GPU or epochs:
+5 folds in parallel on an L40S, about 10-20 minutes and roughly $1-3. Writes `outputs/gemma4-<model>-<timestamp>/{oof.csv,test_probs.csv,metrics.json}` and prints fold and OOF accuracy. To override the model, GPU or epochs (flags beat the `.env` defaults):
 
 ```bash
-uv run modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
+uv run --env-file .env modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
 ```
 
 Other options: `--folds`, `--lr`, `--run-name`, `--seed`, `--data-dir`.
@@ -110,13 +106,12 @@ Validates the file against `data/test.csv`, submits it, then lists your recent s
 
 ```bash
 uv sync
-uv run modal setup                      # or set MODAL_TOKEN_ID / MODAL_TOKEN_SECRET
-# Kaggle: put the token in ~/.kaggle/access_token, or the legacy ~/.kaggle/kaggle.json
-export HF_TOKEN=hf_xxx && bash scripts/setup_secrets.sh
-bash scripts/download_data.sh
+cp .env.example .env     # then fill it in
+make check
+make data
 ```
 
-The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `scripts/download_data.ps1` and `scripts/submit.ps1 -File submissions/submission.csv -Message "..."`, and run the `uv run ...` commands from the Makefile directly.
+The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `scripts/download_data.ps1` and `scripts/submit.ps1 -File submissions/submission.csv -Message "..."` (both read `.env`), and run the `uv run --env-file .env ...` commands from the Makefile directly. `modal_app.py` also loads `.env` itself when run locally.
 
 ## Tuning ideas
 
@@ -136,9 +131,9 @@ A smoke run is about $0.10 and a full 5-fold E2B run roughly $1-3, against the $
 
 ## Troubleshooting
 
-- **Modal auth errors**: check `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` are set (`make setup` prints status). Secrets added after the codespace was created need a restart.
+- **Modal auth errors**: check `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` in `.env` and run `make check`.
 - **Kaggle 403**: you have not joined the competition. Click **Join Competition** and accept the rules.
-- **Hugging Face 401/403**: accept the Gemma license on the model page, check `HF_TOKEN`, then re-run `make secrets`.
+- **Hugging Face 401/403**: accept the Gemma license on the model page, check `HF_TOKEN` in `.env`.
 - **`select_lora_targets` raises ValueError**: the Gemma 4 module names differ from what is expected. Paste the module names from the log and adjust `src/titanic/lora.py`.
 - **CUDA out of memory**: use a bigger `--gpu`, or reduce the batch size in `make_cfg` in `modal_app.py`.
 
@@ -148,9 +143,10 @@ A smoke run is about $0.10 and a full 5-fold E2B run roughly $1-3, against the $
 baseline.py            classical CV models -> outputs/baseline/
 ensemble.py            blend outputs/*/ -> submissions/submission.csv
 modal_app.py           Modal LoRA training and inference
-src/titanic/           features, text prompts, submission I/O, LoRA target selection
-scripts/               download_data, submit, setup_secrets (.sh primary, .ps1 for Windows)
+src/titanic/           features, text prompts, submission I/O, LoRA target selection, .env loader
+scripts/               download_data, submit, check_env (.sh primary, .ps1 for Windows)
 tests/                 pytest suite and synthetic fixtures
+.env.example           template for the single .env config file (.env is gitignored)
 .devcontainer/         Codespaces config and post-create script
 Makefile               shortcuts for every step above
 PLAN.md                design and decisions

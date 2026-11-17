@@ -1,12 +1,14 @@
 .DEFAULT_GOAL := help
 MSG ?= gemma4-titanic submission
+RUN := uv run --env-file .env
 
-.PHONY: help setup secrets data test baseline smoke train ensemble submit clean-outputs
+.PHONY: help setup env check data test baseline smoke train ensemble submit clean-outputs
 
 help:
 	@echo "Targets:"
-	@echo "  setup          install uv, sync dependencies, show secret status"
-	@echo "  secrets        verify Modal/Kaggle auth and create the Modal huggingface-secret"
+	@echo "  setup          install uv, sync dependencies, create .env from .env.example"
+	@echo "  env            fail unless .env exists"
+	@echo "  check          verify .env keys and Modal/Kaggle auth"
 	@echo "  data           download Titanic data from Kaggle into data/"
 	@echo "  test           run pytest"
 	@echo "  baseline       run the classical baseline into outputs/baseline"
@@ -19,10 +21,13 @@ help:
 setup:
 	bash .devcontainer/post-create.sh
 
-secrets:
-	bash scripts/setup_secrets.sh
+env:
+	@test -f .env || { echo "No .env found — run: cp .env.example .env and fill it in" >&2; exit 1; }
 
-data:
+check: env
+	bash scripts/check_env.sh
+
+data: env
 	bash scripts/download_data.sh
 
 test:
@@ -31,16 +36,16 @@ test:
 baseline:
 	uv run python baseline.py
 
-smoke:
-	uv run modal run modal_app.py --smoke
+smoke: env
+	$(RUN) modal run modal_app.py --smoke
 
-train:
-	uv run modal run modal_app.py
+train: env
+	$(RUN) modal run modal_app.py
 
 ensemble:
 	uv run python ensemble.py
 
-submit:
+submit: env
 	bash scripts/submit.sh submissions/submission.csv "$(MSG)"
 
 clean-outputs:

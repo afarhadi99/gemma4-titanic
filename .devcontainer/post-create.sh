@@ -14,7 +14,14 @@ activate='source "$PWD/.venv/bin/activate"'
 grep -qxF "$activate" ~/.bashrc || echo "$activate" >> ~/.bashrc
 grep -q '.local/bin' ~/.bashrc || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
-echo "Secret status (values are never printed):"
-for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN KAGGLE_API_TOKEN KAGGLE_USERNAME KAGGLE_KEY; do
-  if [[ -n "${!name:-}" ]]; then echo "  $name: set"; else echo "  $name: missing"; fi
-done
+[[ -f .env ]] || cp .env.example .env
+
+echo "Keys in .env (values are never printed):"
+while IFS= read -r line; do
+  line="${line#export }"
+  [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+  name="${BASH_REMATCH[1]}"
+  value="$(printf '%s' "${BASH_REMATCH[2]}" | tr -d "[:space:]\"'")"
+  if [[ -n "$value" ]]; then echo "  $name: set"; else echo "  $name: missing"; fi
+done < .env
+echo "Fill in .env, then run: make check"

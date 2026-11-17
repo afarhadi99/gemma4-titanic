@@ -4,6 +4,8 @@ param(
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
+. (Join-Path $PSScriptRoot "load_env.ps1")
+Import-DotEnv
 
 if (-not (Test-Path $File)) { throw "$File not found" }
 
