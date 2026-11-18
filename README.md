@@ -4,7 +4,7 @@ Kaggle [Titanic](https://www.kaggle.com/c/titanic) with a classical baseline and
 
 - **Baseline**: engineered features, logistic regression and gradient boosting, 5-fold CV. Runs locally in seconds.
 - **Gemma 4 LoRA classifier**: each passenger becomes a short English description and the model answers `yes`/`no`. The prediction is a softmax over the two label-token logits, trained K-fold on Modal.
-- **Ensemble**: grid-search blend weights and a threshold on OOF probabilities, then write and validate `submissions/submission.csv`.
+- **Ensemble**: grid-search blend weights (step 0.1, threshold fixed at 0.5 unless `--tune-threshold`) on OOF probabilities, then write and validate `submissions/submission.csv`.
 
 Design details are in [PLAN.md](PLAN.md).
 

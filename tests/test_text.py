@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from titanic.features import engineer, load_raw
+from titanic.features import add_group_features, engineer, load_raw
 from titanic.text import LABEL_WORDS, QUESTION, SYSTEM_PROMPT, describe
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -77,3 +77,43 @@ def test_constants() -> None:
     assert LABEL_WORDS == ("no", "yes")
     assert "yes or no" in QUESTION
     assert SYSTEM_PROMPT
+
+
+def _group_row(**overrides) -> pd.Series:
+    train, _ = engineered()
+    row = train.iloc[0].copy()
+    values = {"GroupSize": 4, "GroupKnownCount": 3, "GroupKnownSurvived": 2}
+    values.update(overrides)
+    for key, value in values.items():
+        row[key] = value
+    return row
+
+
+def test_group_sentence_with_known_members() -> None:
+    text = describe(_group_row())
+    assert text.endswith("of the 3 other members with known outcomes, 2 survived.")
+    assert "Travelling in a group of 4" in text
+
+
+def test_group_sentence_without_known_members() -> None:
+    text = describe(_group_row(GroupKnownCount=0, GroupKnownSurvived=0))
+    assert text.endswith("no other members of this group have known outcomes.")
+    assert "1 other member with" in describe(_group_row(GroupKnownCount=1, GroupKnownSurvived=1))
+
+
+def test_no_group_sentence_when_alone_or_absent() -> None:
+    assert "group" not in describe(_group_row(GroupSize=1, GroupKnownCount=0, GroupKnownSurvived=0))
+    train, _ = engineered()
+    assert "group" not in describe(train.iloc[0])
+
+
+def test_group_description_via_features_has_no_own_label() -> None:
+    train, test = engineered()
+    fit, (val, _) = add_group_features(train.iloc[:16], [train.iloc[16:], test])
+    row = fit.iloc[0]
+    flipped = row.copy()
+    flipped["Survived"] = 1 - row["Survived"]
+    assert describe(row) == describe(flipped)  # label column is never read
+    for _, r in pd.concat([fit, val]).iterrows():
+        assert "survived the" not in describe(r).lower()
+        assert "passengerid" not in describe(r).lower()

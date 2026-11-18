@@ -37,15 +37,36 @@ def _cabin(deck: str) -> str:
     return "Cabin deck unknown." if deck == "U" else f"Cabin deck {deck}."
 
 
+def _group_sentence(row: pd.Series) -> str:
+    """Plain-English group signal; empty when group features are absent or the passenger is alone.
+
+    Uses only counts derived from OTHER passengers' labels (see add_group_features)."""
+    if "GroupKnownCount" not in row.index or pd.isna(row["GroupKnownCount"]):
+        return ""
+    size = int(row["GroupSize"])
+    if size < 2:
+        return ""
+    known = int(row["GroupKnownCount"])
+    intro = f"Travelling in a group of {size} sharing a ticket or family name and fare;"
+    if known == 0:
+        return f"{intro} no other members of this group have known outcomes."
+    survived = int(row["GroupKnownSurvived"])
+    members = _plural(known, "other member", "other members")
+    outcomes = "a known outcome" if known == 1 else "known outcomes"
+    return f"{intro} of the {members} with {outcomes}, {survived} survived."
+
+
 def describe(row: pd.Series) -> str:
     pclass = int(row["Pclass"])
     port = PORTS.get(row["Embarked"], str(row["Embarked"]))
     siblings = _plural(int(row["SibSp"]), "sibling/spouse", "siblings/spouses")
     parents = _plural(int(row["Parch"]), "parent/child", "parents/children")
     group = _plural(int(row["TicketGroupSize"]), "passenger", "passengers")
-    return (
+    text = (
         f"{_who(row)} travelling in {CLASS_WORDS.get(pclass, f'{pclass}th')} class, "
         f"embarked at {port}, paid {float(row['FarePerPerson']):.2f} per person, "
         f"with {siblings} and {parents} aboard (family of {int(row['FamilySize'])}). "
         f"{_cabin(row['Deck'])} Ticket shared by {group}."
     )
+    extra = _group_sentence(row)
+    return f"{text} {extra}" if extra else text

@@ -417,7 +417,7 @@ def train_fold(
     from sklearn.model_selection import StratifiedKFold
     from transformers import AutoTokenizer
 
-    from titanic.features import engineer
+    from titanic.features import add_group_features, engineer
     hf_volume.reload()
     if not os.environ.get("HF_TOKEN"):
         print("WARNING: HF_TOKEN is empty (set it in .env); continuing without it")
@@ -431,8 +431,11 @@ def train_fold(
         tr_idx, va_idx = list(splitter.split(train_df, train_df["Survived"]))[fold]
     else:
         tr_idx, va_idx = np.arange(len(train_df)), np.array([], dtype=int)
-    fit_df = train_df.iloc[tr_idx]
-    val_df = train_df.iloc[va_idx]
+    # Group survival statistics come from the fit rows' labels only (leave-one-out for fit
+    # rows), exactly as in baseline.py; fold -1 uses every train label for the test rows.
+    fit_df, (val_df, test_df) = add_group_features(
+        train_df.iloc[tr_idx], [train_df.iloc[va_idx], test_df]
+    )
     print(f"[fold {fold}] fit={len(fit_df)} val={len(val_df)} test={len(test_df)}", flush=True)
 
     model_id = cfg["model_id"]

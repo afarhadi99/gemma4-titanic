@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 TITLE_PATTERN = re.compile(r",\s*([^.]+)\.")
@@ -68,3 +69,63 @@ def engineer(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame, pd.
         return pd.concat([original.drop(columns=part.columns, errors="ignore"), part], axis=1)
 
     return attach(train, features.iloc[:n_train]), attach(test, features.iloc[n_train:])
+
+
+GROUP_COLS = ["GroupSize", "GroupKnownCount", "GroupKnownSurvived", "GroupSurvivalRate", "GroupNoKnown"]
+
+
+def _group_keys(df: pd.DataFrame) -> pd.Series:
+    """Label-free group id per row: the Ticket if shared, else Surname+Fare if shared, else unique."""
+    ticket = df["Ticket"].astype(str)
+    surname = df["Name"].fillna("").str.split(",").str[0].str.strip().str.lower()
+    fare = df["Fare"].round(2).astype(str)
+    family = surname + "|" + fare
+    key = "t:" + ticket
+    ticket_alone = ticket.groupby(ticket).transform("size") == 1
+    family_shared = (family.groupby(family).transform("size") > 1) & (df["Fare"] > 0) & (surname != "")
+    key = key.where(~(ticket_alone & family_shared), "f:" + family)
+    return key
+
+
+def add_group_features(
+    fit: pd.DataFrame, others: list[pd.DataFrame]
+) -> tuple[pd.DataFrame, list[pd.DataFrame]]:
+    """Ticket / family group survival features without label leakage.
+
+    Groups are formed over fit + others (label-free). Survival statistics use only the
+    labels in `fit`: a fit row sees its group mates' labels but never its own
+    (leave-one-out); rows in `others` see every fit label in their group. Inputs are not
+    mutated. `fit` must hold `Survived`; `others` may or may not.
+    """
+    frames = [fit, *others]
+    combined = pd.concat([f[["Ticket", "Name", "Fare"]] for f in frames], ignore_index=True)
+    keys = _group_keys(combined)
+    n_fit = len(fit)
+    size = keys.groupby(keys).transform("size").to_numpy()
+
+    labels = fit["Survived"].to_numpy(dtype=float)
+    fit_keys = keys.iloc[:n_fit]
+    known = pd.Series(1.0, index=fit_keys.index).groupby(fit_keys.to_numpy()).sum()
+    surv = pd.Series(labels, index=fit_keys.index).groupby(fit_keys.to_numpy()).sum()
+    count = keys.map(known).fillna(0.0).to_numpy().copy()
+    wins = keys.map(surv).fillna(0.0).to_numpy().copy()
+    count[:n_fit] -= 1.0  # leave one out: a fit row never sees its own label
+    wins[:n_fit] -= labels
+
+    stats = pd.DataFrame(
+        {
+            "GroupSize": size.astype(int),
+            "GroupKnownCount": count.astype(int),
+            "GroupKnownSurvived": wins.astype(int),
+        }
+    )
+    stats["GroupSurvivalRate"] = np.where(count > 0, wins / np.maximum(count, 1), np.nan)
+    stats["GroupNoKnown"] = (count == 0).astype(int)
+
+    outputs: list[pd.DataFrame] = []
+    start = 0
+    for frame in frames:
+        part = stats.iloc[start : start + len(frame)].set_axis(frame.index)
+        start += len(frame)
+        outputs.append(pd.concat([frame.drop(columns=GROUP_COLS, errors="ignore"), part], axis=1))
+    return outputs[0], outputs[1:]

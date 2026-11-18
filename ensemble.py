@@ -10,7 +10,9 @@ import pandas as pd
 from titanic.features import load_raw
 from titanic.submission import validate_submission, write_submission
 
-THRESHOLDS = np.round(np.arange(0.30, 0.7001, 0.01), 2)
+THRESHOLDS = np.round(np.arange(0.30, 0.7001, 0.01), 2)  # searched only with --tune-threshold
+DEFAULT_THRESHOLDS = np.array([0.5])
+DEFAULT_STEP = 0.1
 
 
 @dataclass(frozen=True)
@@ -21,7 +23,7 @@ class Blend:
     accuracy: float
 
 
-def weight_grid(n_runs: int, step: float = 0.05) -> np.ndarray:
+def weight_grid(n_runs: int, step: float = DEFAULT_STEP) -> np.ndarray:
     units = round(1 / step)
     if n_runs > 3:
         units = min(units, 10)
@@ -36,11 +38,12 @@ def weight_grid(n_runs: int, step: float = 0.05) -> np.ndarray:
 def find_best_blend(
     probs: np.ndarray,
     y: np.ndarray,
-    step: float = 0.05,
-    thresholds: np.ndarray = THRESHOLDS,
+    step: float = DEFAULT_STEP,
+    thresholds: np.ndarray = DEFAULT_THRESHOLDS,
 ) -> Blend:
-    """probs has shape (n_runs, n_rows). Maximises accuracy; ties prefer a threshold
-    near 0.5, then weights near equal."""
+    """probs has shape (n_runs, n_rows). Maximises accuracy over a coarse weight grid with the
+    threshold fixed at 0.5 unless `thresholds` is widened (searching it overfits the OOF a little).
+    Ties prefer a threshold near 0.5, then weights near equal."""
     n_runs = probs.shape[0]
     grid = weight_grid(n_runs, step)
     blended = grid @ probs
@@ -108,7 +111,7 @@ def usable_runs(candidates: list[Path], data_dir: Path) -> tuple[list[Path], lis
     return usable, skipped
 
 
-def run(runs: list[Path], data_dir: Path, out: Path) -> dict:
+def run(runs: list[Path], data_dir: Path, out: Path, tune_threshold: bool = False) -> dict:
     train, test = load_raw(data_dir)
     for r in runs:
         problem = coverage_problem(r, train["PassengerId"], test["PassengerId"])
@@ -118,7 +121,7 @@ def run(runs: list[Path], data_dir: Path, out: Path) -> dict:
     oof = np.stack([load_probs(r / "oof.csv", train["PassengerId"]) for r in runs])
     test_probs = np.stack([load_probs(r / "test_probs.csv", test["PassengerId"]) for r in runs])
 
-    blend = find_best_blend(oof, y)
+    blend = find_best_blend(oof, y, thresholds=THRESHOLDS if tune_threshold else DEFAULT_THRESHOLDS)
     final = (blend.weights @ test_probs >= blend.threshold).astype(int)
     path = write_submission(test["PassengerId"], final, out)
     validate_submission(path, Path(data_dir) / "test.csv")
@@ -128,6 +131,7 @@ def run(runs: list[Path], data_dir: Path, out: Path) -> dict:
         "runs": names,
         "weights": dict(zip(names, blend.weights.round(4).tolist())),
         "threshold": blend.threshold,
+        "tune_threshold": tune_threshold,
         "oof_accuracy": blend.accuracy,
         "run_oof_accuracy": {
             n: float(((p >= 0.5).astype(int) == y).mean()) for n, p in zip(names, oof)
@@ -143,6 +147,11 @@ def main() -> None:
     parser.add_argument("--runs", nargs="+", type=Path, default=None)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--out", type=Path, default=Path("submissions/submission.csv"))
+    parser.add_argument(
+        "--tune-threshold",
+        action="store_true",
+        help="also search the decision threshold on OOF (default: fixed at 0.5; tuning overfits slightly)",
+    )
     args = parser.parse_args()
 
     runs = args.runs
@@ -153,13 +162,14 @@ def main() -> None:
     if not runs:
         parser.error("no usable runs found; pass --runs or create outputs/<run>/{oof.csv,test_probs.csv}")
 
-    choice = run(runs, args.data_dir, args.out)
-    print("Run OOF accuracy at 0.5:")
+    choice = run(runs, args.data_dir, args.out, args.tune_threshold)
+    print("Each run's own OOF accuracy at 0.5:")
     for name, acc in choice["run_oof_accuracy"].items():
         print(f"  {name:20s} {acc:.4f}")
     print(f"Weights:   {choice['weights']}")
     print(f"Threshold: {choice['threshold']:.2f}")
-    print(f"Blend OOF accuracy: {choice['oof_accuracy']:.4f}")
+    best_single = max(choice["run_oof_accuracy"].values())
+    print(f"Chosen blend OOF accuracy: {choice['oof_accuracy']:.4f}  (best single run {best_single:.4f})")
     print(f"Wrote {choice['submission']}")
 
 

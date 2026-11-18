@@ -6,7 +6,7 @@ import pytest
 
 import json
 
-from ensemble import discover_runs, find_best_blend, load_probs, run, usable_runs, weight_grid
+from ensemble import THRESHOLDS, discover_runs, find_best_blend, load_probs, run, usable_runs, weight_grid
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -17,7 +17,8 @@ def test_weight_grid_is_convex() -> None:
         assert grid.shape[1] == n
         assert np.allclose(grid.sum(axis=1), 1.0)
         assert (grid >= 0).all()
-    assert len(weight_grid(2)) == 21
+    assert len(weight_grid(2)) == 11  # coarse default step 0.1
+    assert len(weight_grid(2, 0.05)) == 21
 
 
 def test_blend_prefers_informative_run() -> None:
@@ -29,10 +30,18 @@ def test_blend_prefers_informative_run() -> None:
     assert blend.weights[0] > 0
 
 
-def test_single_run_finds_threshold() -> None:
+def test_threshold_fixed_at_half_by_default() -> None:
     y = np.array([0, 0, 0, 1, 1, 1])
     probs = np.array([[0.1, 0.2, 0.38, 0.42, 0.6, 0.9]])
     blend = find_best_blend(probs, y)
+    assert blend.threshold == 0.5
+    assert blend.accuracy < 1.0
+
+
+def test_single_run_finds_threshold_when_tuned() -> None:
+    y = np.array([0, 0, 0, 1, 1, 1])
+    probs = np.array([[0.1, 0.2, 0.38, 0.42, 0.6, 0.9]])
+    blend = find_best_blend(probs, y, thresholds=THRESHOLDS)
     assert blend.accuracy == 1.0
     assert 0.38 < blend.threshold <= 0.42
     assert blend.weights.tolist() == [1.0]
