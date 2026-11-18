@@ -2,7 +2,7 @@
 
 Kaggle [Titanic](https://www.kaggle.com/c/titanic) with a classical baseline and a Gemma 4 model fine-tuned with LoRA on [Modal](https://modal.com) GPUs. Out-of-fold (OOF) accuracy decides which models go into the final submission.
 
-- **Baseline**: engineered features, logistic regression and gradient boosting, 5-fold CV. Runs locally in seconds.
+- **Baseline**: engineered features plus leak-free family/ticket group features; logistic regression, HGB, gradient boosting, random forest and SVC, with the best single model or soft-vote average picked by OOF. 5-fold CV, runs locally in seconds.
 - **Gemma 4 LoRA classifier**: each passenger becomes a short English description and the model answers `yes`/`no`. The prediction is a softmax over the two label-token logits, trained K-fold on Modal.
 - **Ensemble**: grid-search blend weights (step 0.1, threshold fixed at 0.5 unless `--tune-threshold`) on OOF probabilities, then write and validate `submissions/submission.csv`.
 
@@ -34,7 +34,7 @@ The commented-out "training defaults" block in `.env.example` (`GEMMA_MODEL_ID`,
 make check
 ```
 
-Prints `set`/`missing` for each key, then verifies Modal and Kaggle auth. Success: `Modal: ok` and `Kaggle: ok`. Every error points back at `.env`.
+Prints `set`/`missing` for each key, then verifies Modal and Kaggle auth. Success: all lines `ok` (`Modal: ok`, `Kaggle: ok`). On failure it prints the real Modal/Kaggle error under `details:`, and every error points back at `.env`.
 
 ## Step 4: download the data
 
@@ -51,7 +51,7 @@ make test
 make baseline
 ```
 
-`make test` runs pytest (all green). `make baseline` writes `outputs/baseline/{oof.csv,test_probs.csv,metrics.json}` and `submissions/baseline.csv`, and prints OOF accuracy per candidate model. Expect about 0.80 OOF; it takes seconds.
+`make test` runs pytest (all green). `make baseline` writes `outputs/baseline/{oof.csv,test_probs.csv,metrics.json}` and `submissions/baseline.csv`, and prints OOF accuracy per candidate model. It takes seconds. On the real data with group features the chosen model was `avg:gb+svc+rf` with OOF 0.8563 (see Results so far).
 
 ## Step 6: smoke test on Modal
 
@@ -59,14 +59,14 @@ make baseline
 make smoke
 ```
 
-Cheap end-to-end check (about $0.10): 64 rows, 2 folds, 1 epoch. The first run downloads the model weights, which takes several minutes. In the log look for:
+Cheap end-to-end check (cents): 64 rows, 2 folds, 1 epoch. The first run downloads the Gemma 4 E2B weights, which takes a few minutes. In the log look for:
 
-- `Loaded <ModelClass>`: Gemma 4 loaded.
-- `Label token ids {'no': ..., 'yes': ...}`: the two label words are distinct single tokens.
-- `LoRA targets: N; examples: [...]`: N is greater than 0.
+- `Loaded with AutoModelForCausalLM + attn_implementation=sdpa(text,vision)+eager(audio)`: Gemma 4 loaded.
+- `Label token ids {'no': 1904, 'yes': 4443}`: the two label words are distinct single tokens.
+- `LoRA targets: 205` (`; examples: [...]` follows): N is greater than 0.
 - `OOF accuracy: ...` at the end and `Wrote outputs/<run>-smoke/`.
 
-The smoke output is marked `"smoke": true` and `make ensemble` skips it automatically.
+The smoke OOF (about 0.64 on 64 rows) is meaningless. The output is marked `"smoke": true` and `make ensemble` skips it automatically.
 
 ## Step 7: full training run
 
@@ -74,7 +74,7 @@ The smoke output is marked `"smoke": true` and `make ensemble` skips it automati
 make train
 ```
 
-5 folds in parallel on an L40S, about 10-20 minutes and roughly $1-3. Writes `outputs/gemma4-<model>-<timestamp>/{oof.csv,test_probs.csv,metrics.json}` and prints fold and OOF accuracy. To override the model, GPU or epochs (flags beat the `.env` defaults):
+5 folds in parallel (the real run used `MODAL_GPU=A100` in `.env`): about 6 minutes wall clock on an A100, well under $2. A harmless `[modal-client] Timed out waiting for final app logs` line can appear at the end; the results are still written. Writes `outputs/gemma4-<model>-<timestamp>/{oof.csv,test_probs.csv,metrics.json}` and prints fold and OOF accuracy. To override the model, GPU or epochs (flags beat the `.env` defaults):
 
 ```bash
 python -m modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
@@ -88,7 +88,7 @@ Other options: `--folds`, `--lr`, `--run-name`, `--seed`, `--data-dir`.
 make ensemble
 ```
 
-Blends every complete run in `outputs/` (baseline plus Gemma runs) and writes `submissions/submission.csv` and `submissions/ensemble.json`. It prints each run's OOF accuracy, the chosen weights and threshold, and the blended OOF accuracy. Runs that are smoke tests or do not cover all train/test PassengerIds are skipped with a `skipping <dir>: ...` message. To pick runs explicitly:
+Threshold is fixed at 0.5 unless you pass `--tune-threshold`; the weight grid step is 0.1. Blends every complete run in `outputs/` (baseline plus Gemma runs) and writes `submissions/submission.csv` and `submissions/ensemble.json`. It prints each run's OOF accuracy, the chosen weights and threshold, and the blended OOF accuracy. Runs that are smoke tests or do not cover all train/test PassengerIds are skipped with a `skipping <dir>: ...` message. To pick runs explicitly:
 
 ```bash
 python ensemble.py --runs outputs/baseline outputs/<gemma-run>
@@ -100,7 +100,31 @@ python ensemble.py --runs outputs/baseline outputs/<gemma-run>
 make submit MSG="baseline + gemma4 e2b blend"
 ```
 
-Validates the file against `data/test.csv`, submits it, then lists your recent submissions. Success: a submission with status `complete` and a public score. Check the leaderboard at https://www.kaggle.com/c/titanic/leaderboard. Public LB uses half the test set, so trust OOF over LB moves of about 1%.
+Validates the file against `data/test.csv`, submits it, then lists your recent submissions. Success: a submission with status `complete` and a public score. Check the leaderboard at https://www.kaggle.com/c/titanic/leaderboard. Trust OOF over small public LB moves (see the note under Results so far).
+
+## Results so far
+
+Real end-to-end run in GitHub Codespaces (2026-11-17), Modal A100, transformers 5.23.0. OOF accuracy on the 891 training rows:
+
+| Model | OOF accuracy |
+| --- | --- |
+| Baseline before group features | 0.8418 |
+| Baseline logreg / hgb / gb / rf / svc (with group features) | 0.8406 / 0.8440 / 0.8485 / 0.8451 / 0.8462 |
+| Baseline chosen: `avg:gb+svc+rf` (3-seed mean 0.8515) | 0.8563 |
+| Gemma 4 E2B LoRA before group features (folds 0.832-0.865) | 0.8373 |
+| Gemma 4 E2B LoRA with group features | 0.8496 |
+| Ensemble (baseline + both Gemma runs) | 0.8563 (weights: baseline 1.0, Gemma 0.0) |
+
+**Kaggle public leaderboard: 0.80143** for `submissions/submission.csv` (the baseline `avg:gb+svc+rf`, since the ensemble gave Gemma zero weight).
+
+Group features lifted Gemma from 0.8373 to 0.8496 OOF, but it still trails the classical vote, so the blend keeps the baseline alone. To make Gemma earn weight, average 2-3 Gemma runs with different `--seed` values or try `--model-id google/gemma-4-E4B-it`.
+
+OOF is the guide. The public leaderboard scores only about 209 passengers, so expect roughly 0.78-0.81 there; an honest 0.80+ is a strong score. Perfect 1.0 scores on the leaderboard come from looking up the public passenger list, not from modelling.
+
+## How accuracy was improved
+
+- **Group features** (`add_group_features` in `src/titanic/features.py`): passengers are grouped by shared ticket, else by surname + fare. For each passenger the group size and survival statistics of the other group members are computed from training-fold labels only (leave-one-out for training rows, so a row never sees its own label). The same facts are written into Gemma's prompt, so the LLM sees them too.
+- **Model soft-vote**: `baseline.py` also scores averages of the best 2 and best 3 single models and keeps whichever has the best OOF; `ensemble.py` then blends the baseline with the Gemma runs.
 
 ## Running locally instead of Codespaces
 
@@ -125,15 +149,17 @@ The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `sc
 - Epochs and learning rate: `--epochs`, `--lr`.
 - Prompt wording: `src/titanic/text.py` (`SYSTEM_PROMPT`, `QUESTION`, `describe`).
 - More folds or other seeds: `--folds`, `--seed`, then ensemble the extra runs.
+- Average 2-3 Gemma runs with different `--seed`.
+- Try `--model-id google/gemma-4-E4B-it`.
 
 ## Costs
 
 | GPU | Approx. $/hour | Notes |
 | --- | --- | --- |
-| L40S (default) | about 1.95 | 48 GB, E2B bf16 LoRA fits easily |
-| A100-80GB | check modal.com/pricing | for larger models |
+| L40S (code default) | check modal.com/pricing | 48 GB, E2B bf16 LoRA fits easily |
+| A100 (used in the real run, `MODAL_GPU=A100`) | about 2.10 per GPU | check modal.com/pricing |
 
-A smoke run is about $0.10 and a full 5-fold E2B run roughly $1-3, against the $30/month free credit.
+A full run is 5 folds x about 6 minutes on A100, well under $2; a smoke run is cents. Modal gives a $30/month free credit.
 
 ## Troubleshooting
 
@@ -142,6 +168,10 @@ A smoke run is about $0.10 and a full 5-fold E2B run roughly $1-3, against the $
 - **Kaggle 403**: you have not joined the competition. Click **Join Competition** and accept the rules.
 - **Hugging Face 401/403**: accept the Gemma license on the model page, check `HF_TOKEN` in `.env`.
 - **`select_lora_targets` raises ValueError**: the Gemma 4 module names differ from what is expected. Paste the module names from the log and adjust `src/titanic/lora.py`.
+- **ValueError about the Gemma 4 audio tower and SDPA**: fixed in the code (text/vision use SDPA, audio uses eager). Only seen if you pin an old commit; update.
+- **`git pull` shows no updates**: if your codespace was created from a fork or copy of the repo, it does not track this repo. Run `git pull https://github.com/afarhadi99/gemma4-titanic.git main`.
+- **`make check` fails**: read the real Modal/Kaggle error printed under `details:`.
+- **Shared a screenshot of `.env`**: rotate the Modal, Hugging Face and Kaggle tokens.
 - **CUDA out of memory**: use a bigger `--gpu`, or reduce the batch size in `make_cfg` in `modal_app.py`.
 
 ## Repo layout

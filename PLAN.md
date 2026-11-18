@@ -23,22 +23,37 @@ secrets, no Modal named secret, no `~/.kaggle` files. `modal_app.py` loads `.env
 Titanic is a tiny tabular problem. A fine-tuned LLM is not obviously better than gradient
 boosting here, so the repo does three things and lets out-of-fold (OOF) accuracy decide:
 
-1. **Classical baseline** (local, free, seconds): engineered features → logistic regression +
-   gradient boosting, 5-fold CV. Expected public LB ≈ 0.77–0.80.
+1. **Classical baseline** (local, free, seconds): engineered features plus leak-free
+   family/ticket group features (shared ticket, else surname+fare; leave-one-out survival
+   stats from training-fold labels only) → logreg, HGB, GB, RF, SVC, and soft-vote averages of
+   the best 2/3 chosen by OOF, 5-fold CV. Real run: OOF 0.8563 (`avg:gb+svc+rf`; 0.8418 before
+   group features). The group facts are also written into Gemma's prompt.
 2. **Gemma 4 LoRA classifier** (Modal GPU): each passenger serialized as a short English
    description; the model is trained to answer `yes`/`no` to "Did this passenger survive?".
    Prediction = softmax over the logits of the `yes` / `no` tokens at the answer position
    (no free-text generation, so outputs are calibrated probabilities). K-fold training gives
    OOF probabilities (honest accuracy) and K test predictions that are averaged.
-3. **Ensemble** (local): grid-search the blend weight and threshold on OOF probabilities,
+3. **Ensemble** (local): grid-search blend weights (step 0.1; threshold fixed at 0.5 unless
+   `--tune-threshold`) on OOF probabilities,
    apply to test probabilities, write `submissions/submission.csv`, validate, submit.
+
+## Results from the real end-to-end run (2026-11-17, Codespaces, Modal A100, transformers 5.23.0)
+
+Flow that worked: `make check` → `data` → `baseline` → `smoke` → `train` → `ensemble` → `submit`.
+Smoke logs `Loaded with AutoModelForCausalLM + attn_implementation=sdpa(text,vision)+eager(audio)`,
+`Label token ids {'no': 1904, 'yes': 4443}`, `LoRA targets: 205`; smoke OOF (~0.64 on 64 rows) is
+meaningless and skipped by the ensemble. `make train` on A100: ~6 min for 5 parallel folds; Gemma
+OOF 0.8373 before group features (folds 0.832–0.865), 0.8496 with them. Baseline with group
+features 0.8563; the ensemble chose the baseline alone (Gemma weight 0.0). Kaggle public LB for
+that submission: 0.80143. The public LB scores ~209 passengers, so expect ~0.78–0.81; perfect LB scores come from
+looking up the public passenger list, not modelling.
 
 ## Key facts from research (2026-11-17)
 
 - Gemma 4 on HF (Apache 2.0): `google/gemma-4-E2B-it` (2.3B eff.), `-E4B-it`, `-12B-it`,
   `-26B-A4B-it` (MoE), `-31B-it`. Default: **`google/gemma-4-E2B-it`**.
 - Load with `AutoModelForCausalLM` first (text-only `Gemma4ForCausalLM`); fall back to
-  `AutoModelForMultimodalLM` if that fails. `attn_implementation="sdpa"`, `dtype=torch.bfloat16`.
+  `AutoModelForMultimodalLM` if that fails. `dtype=torch.bfloat16`; attention is SDPA for text/vision and eager for the audio tower (plain SDPA raised a ValueError on the audio tower), see `ATTN_CANDIDATES`.
 - Gotchas: PEFT rejects `Gemma4ClippableLinear` (vision/audio towers) when `target_modules` is
   a plain name list → build an explicit list of full module names: only `torch.nn.Linear`,
   only inside the language model, leaf name in {q,k,v,o,gate,up,down}_proj (or `.linear`
@@ -48,7 +63,7 @@ boosting here, so the repo does three things and lets out-of-fold (OOF) accuracy
 - Modal SDK 1.6.4. `modal.Image.debian_slim(python_version="3.12").uv_pip_install(...)`,
   `.add_local_python_source("titanic")`, `modal.Volume.from_name(..., create_if_missing=True)`,
   `vol.commit()`, `modal.Secret.from_dict({"HF_TOKEN": ...})`, `Function.with_options(gpu=...)`.
-  $30/month free credit. Default GPU **L40S** (48 GB, ≈ $1.95/h); E2B bf16 LoRA fits easily.
+  $30/month free credit. Code default GPU **L40S**; the real run used `MODAL_GPU=A100` (~$2.10/h per GPU, check modal.com/pricing).
 - Kaggle CLI (current): competition is positional — `kaggle competitions download titanic`,
   `kaggle competitions submit titanic -f FILE -m MSG`. Must click "Join Competition" first.
 
@@ -154,7 +169,7 @@ Run artifacts — every model writes to `outputs/<run_name>/`:
 - Local: `python -m pytest` green; `python -m py_compile modal_app.py`;
   `python baseline.py --data-dir tests/fixtures` and `ensemble.py` run on fixtures.
 - Cloud (needs owner's go-ahead, spends Modal credit): `modal run modal_app.py --smoke`
-  then a full 5-fold run (≈ 10–20 min on L40S, well under $2).
+  then a full 5-fold run (≈ 6 min wall clock on A100, 5 folds in parallel, well under $2).
 
 ## Risks
 
