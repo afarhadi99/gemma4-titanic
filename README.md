@@ -2,7 +2,7 @@
 
 Kaggle [Titanic](https://www.kaggle.com/c/titanic) with a classical baseline and a Gemma 4 model fine-tuned with LoRA on [Modal](https://modal.com) GPUs. Out-of-fold (OOF) accuracy decides which models go into the final submission.
 
-- **Baseline**: engineered features plus leak-free family/ticket group features; logistic regression, HGB, gradient boosting, random forest and SVC, with the best single model or soft-vote average picked by OOF. 5-fold CV, runs locally in seconds.
+- **Baseline**: engineered features plus leak-free family/ticket group features; logistic regression, HGB, gradient boosting, random forest, SVC, CatBoost, XGBoost, LightGBM, TabPFN and TabICL, with the best single model or soft-vote average picked by OOF. 5-fold CV, runs locally in seconds.
 - **Gemma 4 LoRA classifier**: each passenger becomes a short English description and the model answers `yes`/`no`. The prediction is a softmax over the two label-token logits, trained K-fold on Modal.
 - **Ensemble**: grid-search blend weights (step 0.1, threshold fixed at 0.5 unless `--tune-threshold`) on OOF probabilities, then write and validate `submissions/submission.csv`.
 
@@ -124,6 +124,7 @@ OOF is the guide. The public leaderboard scores only about 209 passengers, so ex
 ## How accuracy was improved
 
 - **Group features** (`add_group_features` in `src/titanic/features.py`): passengers are grouped by shared ticket, else by surname + fare. For each passenger the group size and survival statistics of the other group members are computed from training-fold labels only (leave-one-out for training rows, so a row never sees its own label). The same facts are written into Gemma's prompt, so the LLM sees them too.
+- **More tabular candidates** (all inside each CV fold, group features from fit labels only, one fixed small-data config each, not tuned on OOF): CatBoost, XGBoost and LightGBM use native categorical columns (Sex, Embarked, Title, Deck; Pclass too for CatBoost), and the pretrained tabular foundation models TabPFN and TabICLv2 get the raw features with no one-hot and no scaling (categoricals as integer codes for TabPFN). The soft-vote considers them like any other model. Restrict candidates with `BASELINE_MODELS=gb,svc,rf` or `python baseline.py --models gb svc rf`.
 - **Model soft-vote**: `baseline.py` also scores averages of the best 2 and best 3 single models and keeps whichever has the best OOF; `ensemble.py` then blends the baseline with the Gemma runs.
 
 ## Running locally instead of Codespaces
@@ -150,6 +151,7 @@ The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `sc
 - Prompt wording: `src/titanic/text.py` (`SYSTEM_PROMPT`, `QUESTION`, `describe`).
 - More folds or other seeds: `--folds`, `--seed`, then ensemble the extra runs.
 - Average 2-3 Gemma runs with different `--seed`.
+- **TabPFN** (`TABPFN_VERSION` / `TABPFN_TOKEN` in `.env`): `v2` weights download with no login and are the default. `v3.5-fast` and `v3.5` weights are under a **non-commercial license**: fine for Kaggle's Titanic learning competition, but not for commercial use. Accept the license at https://ux.priorlabs.ai and put the token it gives you in `TABPFN_TOKEN` (the default version becomes `v3.5-fast`). Without a token, v3.5 is skipped with a one-line message. TabICLv2 (`tabicl`, BSD-3 code and weights from the `jingang/TabICL` Hugging Face repo) is permissive and needs no login. torch is installed from the CPU-only wheel index (see `requirements.txt`), so Codespaces does not pull CUDA.
 - Try `--model-id google/gemma-4-E4B-it`.
 - Other models (same prompt, folds, epochs, lr and LoRA settings; only attention, label tokens, LoRA target names and chat-template kwargs adapt automatically):
 

@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import warnings
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.svm import SVC
 
+from titanic.env import load_env
 from titanic.features import CATEGORICAL_COLS, NUMERIC_COLS, add_group_features, engineer, load_raw
 from titanic.submission import validate_submission, write_submission
 
@@ -21,6 +23,9 @@ warnings.filterwarnings("ignore", message=".*probability.*", category=FutureWarn
 
 GROUP_NUMERIC_COLS = ["GroupSize", "GroupKnownCount", "GroupRate", "GroupNoKnown"]
 BASE_MODELS = ["logreg", "hgb", "gb", "rf", "svc"]
+EXTRA_MODELS = ["catboost", "xgboost", "lightgbm", "tabpfn", "tabicl"]
+ALL_MODELS = BASE_MODELS + EXTRA_MODELS
+TABPFN_VERSIONS = ("v2", "v3.5-fast", "v3.5")
 OLD_MODELS = ["logreg", "hgb"]
 GROUP_PRIOR = 2.0  # pseudo-observations at 0.5 when smoothing the group survival rate
 
@@ -29,8 +34,100 @@ def feature_cols(use_group: bool) -> tuple[list[str], list[str]]:
     return NUMERIC_COLS + (GROUP_NUMERIC_COLS if use_group else []), CATEGORICAL_COLS
 
 
-def make_model(name: str, seed: int, use_group: bool = True) -> Pipeline:
+def tabpfn_version() -> str:
+    """TABPFN_VERSION from the environment; default v3.5-fast with a token, else v2 (no login needed)."""
+    default = "v3.5-fast" if os.environ.get("TABPFN_TOKEN") else "v2"
+    return os.environ.get("TABPFN_VERSION", "").strip() or default
+
+
+class FrameModel:
+    """Tabular models that take raw categorical columns (no one-hot, no scaling).
+
+    CatBoost, XGBoost and LightGBM use their native categorical support, TabPFN gets integer
+    codes plus `categorical_features_indices`, TabICL gets the DataFrame itself.
+    """
+
+    def __init__(self, kind: str, seed: int, numeric: list[str], categorical: list[str]):
+        self.kind, self.seed, self.numeric, self.categorical = kind, seed, numeric, categorical
+
+    def _prep(self, x: pd.DataFrame) -> pd.DataFrame:
+        x = x[self.num_ + self.cat_].copy()
+        if self.kind == "catboost":
+            x["Pclass"] = x["Pclass"].astype(int).astype(str)
+            return x
+        if self.kind in ("xgboost", "lightgbm"):
+            for col in self.cat_:
+                x[col] = x[col].astype(str).astype(pd.CategoricalDtype(self.categories_[col]))  # unseen -> NaN
+            return x
+        if self.kind == "tabpfn":
+            x[self.cat_] = self.encoder_.transform(x[self.cat_].astype(str))
+            return x.astype(float)
+        for col in self.cat_:  # tabicl encodes object columns itself
+            x[col] = x[col].astype(str).astype(object)
+        return x
+
+    def fit(self, x: pd.DataFrame, y: np.ndarray) -> "FrameModel":
+        from sklearn.preprocessing import OrdinalEncoder
+
+        seed = self.seed
+        self.num_, self.cat_ = list(self.numeric), list(self.categorical)
+        if self.kind == "catboost":  # Pclass is categorical for CatBoost
+            self.num_.remove("Pclass")
+            self.cat_.append("Pclass")
+        self.categories_ = {c: sorted(x[c].astype(str).unique()) for c in self.cat_}
+        if self.kind == "tabpfn":
+            self.encoder_ = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1).fit(
+                x[self.cat_].astype(str)
+            )
+        if self.kind == "catboost":
+            from catboost import CatBoostClassifier
+
+            self.clf_ = CatBoostClassifier(
+                depth=5, iterations=600, learning_rate=0.03, l2_leaf_reg=4, random_seed=seed,
+                verbose=0, allow_writing_files=False, thread_count=1, one_hot_max_size=10,
+                cat_features=self.cat_,
+            )
+        elif self.kind == "xgboost":
+            from xgboost import XGBClassifier
+
+            self.clf_ = XGBClassifier(
+                max_depth=4, n_estimators=400, learning_rate=0.04, subsample=0.8, colsample_bytree=0.8,
+                enable_categorical=True, tree_method="hist", random_state=seed, n_jobs=1,
+            )
+        elif self.kind == "lightgbm":
+            from lightgbm import LGBMClassifier
+
+            self.clf_ = LGBMClassifier(
+                num_leaves=12, min_child_samples=15, n_estimators=400, learning_rate=0.04,
+                subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=seed,
+                n_jobs=1, verbose=-1,
+            )
+        elif self.kind == "tabpfn":
+            from tabpfn import TabPFNClassifier
+            from tabpfn.constants import ModelVersion
+
+            version = ModelVersion(tabpfn_version())
+            self.clf_ = TabPFNClassifier.create_default_for_version(
+                version,
+                device="cpu",
+                random_state=seed,
+                categorical_features_indices=list(range(len(self.num_), len(self.num_) + len(self.cat_))),
+            )
+        else:
+            from tabicl import TabICLClassifier
+
+            self.clf_ = TabICLClassifier(random_state=seed, device="cpu")
+        self.clf_.fit(self._prep(x), y)
+        return self
+
+    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        return self.clf_.predict_proba(self._prep(x))
+
+
+def make_model(name: str, seed: int, use_group: bool = True) -> Pipeline | FrameModel:
     numeric, categorical = feature_cols(use_group)
+    if name in EXTRA_MODELS:
+        return FrameModel(name, seed, numeric, categorical)
     encoder = OneHotEncoder(handle_unknown="ignore")
     scaled = ColumnTransformer([("num", StandardScaler(), numeric), ("cat", encoder, categorical)])
     raw = ColumnTransformer([("num", "passthrough", numeric), ("cat", encoder, categorical)])
@@ -57,6 +154,47 @@ def make_model(name: str, seed: int, use_group: bool = True) -> Pipeline:
         random_state=seed,
     )
     return Pipeline([("prep", raw), ("clf", clf)])
+
+
+def unavailable_reason(name: str) -> str | None:
+    """None if the model can run here, else a one-line reason (never includes secrets)."""
+    if name not in EXTRA_MODELS:
+        return None
+    try:
+        if name == "tabpfn":
+            version = tabpfn_version()
+            if version not in TABPFN_VERSIONS:
+                return f"TABPFN_VERSION={version!r} is not one of {', '.join(TABPFN_VERSIONS)}"
+            if version != "v2" and not os.environ.get("TABPFN_TOKEN"):
+                return f"TabPFN {version} needs TABPFN_TOKEN (non-commercial license, ux.priorlabs.ai)"
+            os.environ.setdefault("TABPFN_NO_BROWSER", "1")  # never block on a browser login
+        # Tiny probe fit: checks the import and that the weights download without a login.
+        rng = np.random.RandomState(0)
+        probe = pd.DataFrame({"a": rng.rand(40), "Pclass": rng.randint(1, 4, 40).astype(float), "c": ["x", "y"] * 20})
+        FrameModel(name, 0, ["a", "Pclass"], ["c"]).fit(probe, np.arange(40) % 2).predict_proba(probe)
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {' '.join(str(exc).split())[:120]}"
+    return None
+
+
+def resolve_models(requested: list[str] | None = None) -> list[str]:
+    """Candidate list: `requested` (or BASELINE_MODELS, else all), minus models that cannot run here."""
+    if not requested:
+        env = os.environ.get("BASELINE_MODELS", "").replace(",", " ").split()
+        requested = env or ALL_MODELS
+    unknown = [n for n in requested if n not in ALL_MODELS]
+    if unknown:
+        raise SystemExit(f"Unknown model(s) {unknown}; choose from {ALL_MODELS}")
+    names = []
+    for name in requested:
+        reason = unavailable_reason(name)
+        if reason:
+            print(f"Skipping {name}: {reason}")
+        else:
+            names.append(name)
+    if not names:
+        raise SystemExit("No usable candidate models")
+    return names
 
 
 def model_matrix(df: pd.DataFrame, use_group: bool = True) -> pd.DataFrame:
@@ -124,12 +262,20 @@ def average_members(name: str) -> list[str]:
     return name.removeprefix("avg:").split("+")
 
 
-def run(data_dir: Path, out_dir: Path, folds: int, seed: int, extra_seeds: tuple[int, ...] = ()) -> dict:
+def run(
+    data_dir: Path,
+    out_dir: Path,
+    folds: int,
+    seed: int,
+    extra_seeds: tuple[int, ...] = (),
+    models: list[str] | None = None,
+) -> dict:
     train_raw, test_raw = load_raw(data_dir)
     train, test = engineer(train_raw, test_raw)
     y = train["Survived"].to_numpy().astype(int)
 
-    oof, splits = cross_validate(BASE_MODELS, train, y, folds, seed, test=test)
+    candidates = resolve_models(models)
+    oof, splits = cross_validate(candidates, train, y, folds, seed, test=test)
     oof = add_averages(oof, y)
     chosen = pick_best(oof, y)
     members = average_members(chosen) if chosen.startswith("avg:") else [chosen]
@@ -161,6 +307,8 @@ def run(data_dir: Path, out_dir: Path, folds: int, seed: int, extra_seeds: tuple
         "fold_accuracies": [accuracy(y[idx], oof[chosen][idx]) for idx in splits],
         "candidate_oof_accuracy": {n: accuracy(y, p) for n, p in oof.items()},
     }
+    if "tabpfn" in candidates:
+        metrics["tabpfn_version"] = tabpfn_version()
     if extra_seeds:
         metrics["chosen_oof_by_seed"] = {str(k): v for k, v in seed_oof.items()}
         metrics["chosen_oof_mean_over_seeds"] = float(np.mean(list(seed_oof.values())))
@@ -185,12 +333,17 @@ def main() -> None:
         "--check-seeds", type=int, nargs="*", default=[7, 123],
         help="extra CV seeds used only to report the chosen model's OOF accuracy (default: 7 123)",
     )
+    parser.add_argument(
+        "--models", nargs="*", default=None,
+        help=f"restrict candidates (default: BASELINE_MODELS env, else all of {' '.join(ALL_MODELS)})",
+    )
+    load_env()
     args = parser.parse_args()
 
-    metrics = run(args.data_dir, args.out_dir, args.folds, args.seed, tuple(args.check_seeds))
+    metrics = run(args.data_dir, args.out_dir, args.folds, args.seed, tuple(args.check_seeds), args.models)
     print(f"Chosen: {metrics['model']}  OOF accuracy: {metrics['oof_accuracy']:.4f}")
     for name, acc in metrics["candidate_oof_accuracy"].items():
-        print(f"  {name:8s} {acc:.4f}")
+        print(f"  {name:22s} {acc:.4f}")
     if "chosen_oof_mean_over_seeds" in metrics:
         print(f"Chosen model OOF by CV seed: {metrics['chosen_oof_by_seed']}  mean {metrics['chosen_oof_mean_over_seeds']:.4f}")
     print(f"Wrote {args.out_dir} and submissions/baseline.csv")

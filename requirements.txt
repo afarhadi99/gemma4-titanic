@@ -1,5 +1,7 @@
 # Install everything with plain pip:  python -m pip install -r requirements.txt
 # (create a venv first: python -m venv .venv, then activate it). Python 3.11-3.13.
+# torch comes from the CPU-only index so Codespaces does not download CUDA wheels (TabPFN runs on CPU here).
+--extra-index-url https://download.pytorch.org/whl/cpu
 modal==1.6.4
 kaggle==2.2.5
 six==1.17.0
@@ -7,4 +9,11 @@ pandas==3.1.1
 numpy==2.4.6
 scikit-learn==1.9.1
 pytest==9.2.0
+catboost==1.2.10
+torch==2.15.0+cpu ; sys_platform != "darwin"
+torch==2.15.0 ; sys_platform == "darwin"
+tabpfn==10.2.0
+xgboost==3.4.1
+lightgbm==4.7.0
+tabicl==2.2.0
 -e .
