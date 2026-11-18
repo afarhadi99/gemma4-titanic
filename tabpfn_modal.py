@@ -234,7 +234,6 @@ def tabpfn_seed(
     """All requested models for one CV seed on the GPU (test probabilities only when with_test)."""
     import torch
 
-    cache_volume.reload()
     os.environ["TABPFN_VERSION"] = version
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"seed {seed}: models {models}, device {device}, version {version}")
