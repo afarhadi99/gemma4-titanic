@@ -116,7 +116,25 @@ Real end-to-end run in GitHub Codespaces (2026-11-17), Modal A100, transformers 
 | Gemma 4 E2B LoRA with group features | 0.8496 |
 | Ensemble (baseline + both Gemma runs) | 0.8563 (weights: baseline 1.0, Gemma 0.0) |
 
-**Kaggle public leaderboard: 0.80143** for `submissions/submission.csv` (the baseline `avg:gb+svc+rf`, since the ensemble gave Gemma zero weight).
+**Best Kaggle public leaderboard: 0.80382**, from Woman-Child-Group rules plus Gemma flips (`python wcg.py --nearby --model-run outputs/<gemma run>`, file `wcg_h3.csv`).
+
+All 10 submissions on 2026-11-17, each testing one whole-model idea (no per-passenger leaderboard probing):
+
+| Submission | Held-out (CV) | Public LB |
+| --- | --- | --- |
+| **WCG (nearby tickets) + Gemma flips at 0.8/0.2** | ~0.84 | **0.80382** |
+| Baseline vote GB + SVC + RF with group features | 0.856 (3-seed 0.8515) | 0.80143 |
+| Pure WCG rules, with / without nearby-ticket links | 0.842 / 0.840 | 0.80143 / 0.80143 |
+| WCG + TabPFN-vote flips (with / without nearby links) | 0.845 | 0.80143 |
+| Gemma LLM + WCG overrides | 0.850 | 0.80143 |
+| Majority of the best, WCG and TabPFN vote | n/a | 0.80143 |
+| Vote TabPFN-3.5 + CatBoost + HGB | 0.8552 (3-seed 0.8530) | 0.77511 |
+
+Lessons:
+- Held-out CV did not predict the leaderboard. The best-CV vote scored lowest, because models that depart from the gender rule look good on train folds but not on test.
+- The Woman-Child-Group rule (women live unless their whole family group died; boys die unless their family group survived; men die), with groups linked across train and test, reaches the honest ceiling of about 0.80 on its own.
+- Only letting a model overturn the rules when it is very confident (Gemma, p > 0.8 or < 0.2) added one more correct public passenger.
+- Scores near 1.0 on this leaderboard come from looking up the public passenger list, not from modelling.
 
 Group features lifted Gemma from 0.8373 to 0.8496 OOF, but it still trails the classical vote, so the blend keeps the baseline alone. To make Gemma earn weight, average 2-3 Gemma runs with different `--seed` values or try `--model-id google/gemma-4-E4B-it`.
 
