@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [[ -x .venv/bin/python ]]; then PY=.venv/bin/python
+elif command -v python3 >/dev/null 2>&1; then PY=python3
+else PY=python; fi
+
 fail() { echo "error: $1" >&2; exit 1; }
 
 [[ -f .env ]] || fail "no .env found. Run: cp .env.example .env and fill it in."
@@ -21,9 +25,9 @@ done
   || fail "set KAGGLE_API_TOKEN (or KAGGLE_USERNAME + KAGGLE_KEY) in .env."
 
 echo "Checking Modal auth..."
-uv run modal token info >/dev/null 2>&1 || fail "Modal auth failed. Check MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in .env."
+"$PY" -m modal token info >/dev/null 2>&1 || fail "Modal auth failed. Check MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in .env."
 echo "  Modal: ok"
 
 echo "Checking Kaggle auth..."
-uv run kaggle competitions list -s titanic >/dev/null 2>&1 || fail "Kaggle auth failed. Check KAGGLE_API_TOKEN (or KAGGLE_USERNAME + KAGGLE_KEY) in .env."
+"$PY" -m kaggle competitions list -s titanic >/dev/null 2>&1 || fail "Kaggle auth failed. Check KAGGLE_API_TOKEN (or KAGGLE_USERNAME + KAGGLE_KEY) in .env."
 echo "  Kaggle: ok"

@@ -14,8 +14,8 @@ Modal client), `HF_TOKEN` (forwarded to containers via `modal.Secret.from_dict`,
 that leaves the machine), `KAGGLE_API_TOKEN` (or `KAGGLE_USERNAME` + `KAGGLE_KEY`), plus optional
 training defaults (`GEMMA_MODEL_ID`, `MODAL_GPU`, `FOLDS`, `EPOCHS`, `LR`, `SEED`). No Codespaces
 secrets, no Modal named secret, no `~/.kaggle` files. `modal_app.py` loads `.env` itself via
-`titanic.env.load_env`; the Makefile and scripts also load it (`uv run --env-file .env`,
-`set -a; . ./.env`). `make check` verifies keys and Modal/Kaggle auth. Bash scripts and a
+`titanic.env.load_env`; the Makefile and scripts also load it (`set -a; . ./.env` in bash,
+`Import-DotEnv` in PowerShell). `make check` verifies keys and Modal/Kaggle auth. Bash scripts and a
 `Makefile` are the primary interface; `.ps1` scripts remain for local Windows use.
 
 ## Strategy
@@ -57,7 +57,8 @@ boosting here, so the repo does three things and lets out-of-fold (OOF) accuracy
 ```
 README.md                    step-by-step directions                       (docs pass)
 PLAN.md                      this file                                     (Opus)
-pyproject.toml               uv project, local deps                        (Agent A)
+pyproject.toml               pyproject.toml (hatchling) for `-e .`             (Agent A)
+requirements.txt             pinned deps, installed with plain pip         (Agent A)
 .gitignore                   data/, outputs/, submissions/, .venv, .env    (Agent A)
 .env.example                 template for the single .env config file      (Agent A)
 src/titanic/env.py           dependency-free .env loader                   (Agent A)
@@ -150,8 +151,8 @@ Run artifacts — every model writes to `outputs/<run_name>/`:
 
 ## Verification
 
-- Local: `uv run pytest` green; `uv run python -m py_compile modal_app.py`;
-  `uv run python baseline.py --data-dir tests/fixtures` and `ensemble.py` run on fixtures.
+- Local: `python -m pytest` green; `python -m py_compile modal_app.py`;
+  `python baseline.py --data-dir tests/fixtures` and `ensemble.py` run on fixtures.
 - Cloud (needs owner's go-ahead, spends Modal credit): `modal run modal_app.py --smoke`
   then a full 5-fold run (≈ 10–20 min on L40S, well under $2).
 

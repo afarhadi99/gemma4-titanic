@@ -4,16 +4,14 @@ version = "0.1.0"
 description = "Kaggle Titanic: classical baseline plus Gemma 4 LoRA fine-tuned on Modal"
 requires-python = ">=3.11"
 dependencies = [
-    "modal==1.6.4",
-    "kaggle",
-    "pandas",
-    "numpy",
-    "scikit-learn",
+    "modal>=1.6.4",
+    "kaggle>=2.2.5",
     "six>=1.17.0",
+    "pandas>=3.1.1",
+    "numpy>=2.4.6",
+    "scikit-learn>=1.9.1",
+    "pytest>=9.2.0",
 ]
-
-[dependency-groups]
-dev = ["pytest"]
 
 [build-system]
 requires = ["hatchling"]

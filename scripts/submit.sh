@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [[ -x .venv/bin/python ]]; then PY=.venv/bin/python
+elif command -v python3 >/dev/null 2>&1; then PY=python3
+else PY=python; fi
+
 if [[ ! -f .env ]]; then
   echo "error: no .env found. Run: cp .env.example .env and fill it in." >&2
   exit 1
@@ -19,12 +23,12 @@ if [[ ! -f "$FILE" ]]; then
   exit 1
 fi
 
-uv run python -c "
+"$PY" -c "
 import sys
 from titanic.submission import validate_submission
 validate_submission(sys.argv[1], 'data/test.csv')
 print('submission valid:', sys.argv[1])
 " "$FILE"
 
-uv run kaggle competitions submit titanic -f "$FILE" -m "$MESSAGE"
-uv run kaggle competitions submissions titanic
+"$PY" -m kaggle competitions submit titanic -f "$FILE" -m "$MESSAGE"
+"$PY" -m kaggle competitions submissions titanic

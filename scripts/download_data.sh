@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [[ -x .venv/bin/python ]]; then PY=.venv/bin/python
+elif command -v python3 >/dev/null 2>&1; then PY=python3
+else PY=python; fi
+
 if [[ ! -f .env ]]; then
   echo "error: no .env found. Run: cp .env.example .env and fill it in." >&2
   exit 1
@@ -16,13 +20,8 @@ if [[ -z "${KAGGLE_API_TOKEN:-}" && ( -z "${KAGGLE_USERNAME:-}" || -z "${KAGGLE_
   exit 1
 fi
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "error: uv not found. Install it: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
-  exit 1
-fi
-
 mkdir -p data
-uv run kaggle competitions download titanic -p data
+"$PY" -m kaggle competitions download titanic -p data
 unzip -o data/titanic.zip -d data
 
 for f in train test; do

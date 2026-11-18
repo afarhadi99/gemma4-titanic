@@ -10,9 +10,9 @@ forwarded to the GPU containers. Optional defaults: GEMMA_MODEL_ID, MODAL_GPU, F
 EPOCHS, LR, SEED. Command-line flags override them.
 
 Usage (run from the repo root, data in ./data):
-    uv run modal run modal_app.py --smoke
-    uv run modal run modal_app.py
-    uv run modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
+    python -m modal run modal_app.py --smoke
+    python -m modal run modal_app.py
+    python -m modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
 
 Results land in outputs/<run-name>/{oof.csv,test_probs.csv,metrics.json}; adapters are
 saved to the `titanic-gemma4-runs` Modal volume under /runs/<run-name>/fold<k>/.
@@ -486,5 +486,5 @@ def main(
     print(f"OOF accuracy: {metrics['oof_accuracy']:.4f}")
     print(f"Wrote {out_dir}/")
     print("\nNext:")
-    print("  make ensemble          # or: uv run python ensemble.py")
+    print("  make ensemble          # or: python ensemble.py")
     print("  make submit MSG=\"gemma4 lora\"   # or: bash scripts/submit.sh")

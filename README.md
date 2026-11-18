@@ -10,7 +10,7 @@ Design details are in [PLAN.md](PLAN.md).
 
 ## Step 1: open the codespace
 
-Code > Codespaces > **Create codespace on main** (or clone the repo locally and run `bash .devcontainer/post-create.sh`, i.e. `make setup`). The post-create script installs uv, runs `uv sync`, activates the venv in new shells and creates `.env` from `.env.example` if it is missing. It then prints which keys in `.env` are `set` or `missing` (never the values).
+Code > Codespaces > **Create codespace on main** (or clone the repo locally and run `bash .devcontainer/post-create.sh`, i.e. `make setup`). The post-create script creates `.venv`, upgrades pip, runs `python -m pip install -r requirements.txt`, activates the venv in new shells and creates `.env` from `.env.example` if it is missing. It then prints which keys in `.env` are `set` or `missing` (never the values).
 
 ## Step 2: fill in `.env`
 
@@ -77,7 +77,7 @@ make train
 5 folds in parallel on an L40S, about 10-20 minutes and roughly $1-3. Writes `outputs/gemma4-<model>-<timestamp>/{oof.csv,test_probs.csv,metrics.json}` and prints fold and OOF accuracy. To override the model, GPU or epochs (flags beat the `.env` defaults):
 
 ```bash
-uv run --env-file .env modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
+python -m modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
 ```
 
 Other options: `--folds`, `--lr`, `--run-name`, `--seed`, `--data-dir`.
@@ -91,7 +91,7 @@ make ensemble
 Blends every complete run in `outputs/` (baseline plus Gemma runs) and writes `submissions/submission.csv` and `submissions/ensemble.json`. It prints each run's OOF accuracy, the chosen weights and threshold, and the blended OOF accuracy. Runs that are smoke tests or do not cover all train/test PassengerIds are skipped with a `skipping <dir>: ...` message. To pick runs explicitly:
 
 ```bash
-uv run python ensemble.py --runs outputs/baseline outputs/<gemma-run>
+python ensemble.py --runs outputs/baseline outputs/<gemma-run>
 ```
 
 ## Step 9: submit
@@ -104,14 +104,20 @@ Validates the file against `data/test.csv`, submits it, then lists your recent s
 
 ## Running locally instead of Codespaces
 
+Needs Python 3.11-3.13. Create a venv and install everything from `requirements.txt` with plain pip.
+
 ```bash
-uv sync
-cp .env.example .env     # then fill it in
+python -m venv .venv
+source .venv/bin/activate          # PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+cp .env.example .env               # PowerShell: Copy-Item .env.example .env; then fill it in
 make check
 make data
 ```
 
-The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `scripts/download_data.ps1` and `scripts/submit.ps1 -File submissions/submission.csv -Message "..."` (both read `.env`), and run the `uv run --env-file .env ...` commands from the Makefile directly. `modal_app.py` also loads `.env` itself when run locally.
+`make install` does the venv and install steps in one go.
+
+The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `scripts/download_data.ps1` and `scripts/submit.ps1 -File submissions/submission.csv -Message "..."` (both read `.env`), and run the Makefile commands directly with the venv Python (for example `python -m modal run modal_app.py --smoke`, `python baseline.py`). `modal_app.py` also loads `.env` itself when run locally.
 
 ## Tuning ideas
 
@@ -132,6 +138,7 @@ A smoke run is about $0.10 and a full 5-fold E2B run roughly $1-3, against the $
 ## Troubleshooting
 
 - **Modal auth errors**: check `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` in `.env` and run `make check`.
+- **Can't install modal**: upgrade pip first (`python -m pip install --upgrade pip`), use Python 3.11-3.13, and on Windows try a fresh venv (`python -m venv .venv`, activate it, then `python -m pip install -r requirements.txt`). In Codespaces, `make install` re-runs the install.
 - **Kaggle 403**: you have not joined the competition. Click **Join Competition** and accept the rules.
 - **Hugging Face 401/403**: accept the Gemma license on the model page, check `HF_TOKEN` in `.env`.
 - **`select_lora_targets` raises ValueError**: the Gemma 4 module names differ from what is expected. Paste the module names from the log and adjust `src/titanic/lora.py`.
