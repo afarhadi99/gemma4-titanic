@@ -70,3 +70,37 @@ def describe(row: pd.Series) -> str:
     )
     extra = _group_sentence(row)
     return f"{text} {extra}" if extra else text
+
+
+def _age_field(row: pd.Series) -> str:
+    age = float(row["Age"])
+    if bool(row["AgeMissing"]):
+        return f"{round(age)} (estimated)"
+    return str(int(age)) if age == int(age) else f"{age:g}"
+
+
+def describe_structured(row: pd.Series) -> str:
+    """Key-value rendering of the same facts as `describe` (never the label or PassengerId)."""
+    pclass = int(row["Pclass"])
+    deck = "unknown" if row["Deck"] == "U" else row["Deck"]
+    parts = [
+        f"Sex: {str(row['Sex']).lower()}",
+        f"Age: {_age_field(row)}",
+        f"Class: {pclass}",
+        f"Title: {row['Title']}",
+        f"Fare per person: {float(row['FarePerPerson']):.2f}",
+        f"Embarked: {PORTS.get(row['Embarked'], str(row['Embarked']))}",
+        f"Family size: {int(row['FamilySize'])}",
+        f"Deck: {deck}",
+        f"Ticket group size: {int(row['TicketGroupSize'])}",
+    ]
+    if "GroupKnownCount" in row.index and not pd.isna(row["GroupKnownCount"]) and int(row["GroupSize"]) >= 2:
+        known = int(row["GroupKnownCount"])
+        outcomes = f"Group outcomes known: {known}"
+        if known:
+            outcomes += f", survived: {int(row['GroupKnownSurvived'])}"
+        parts.append(outcomes)
+    return " | ".join(parts)
+
+
+PROMPT_STYLES = {"prose": describe, "structured": describe_structured}

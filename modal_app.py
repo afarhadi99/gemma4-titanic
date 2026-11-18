@@ -15,8 +15,21 @@ Usage (run from the repo root, data in ./data):
     python -m modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
     python -m modal run modal_app.py --model-id openbmb/MiniCPM5-2B
 
+Optimisation flags (all recorded in metrics.json): --seed (training randomness) vs --split-seed
+(StratifiedKFold seed, fixed at 42 so seed-averaged runs share folds), --head lm|classification,
+--prompt-style prose|structured, --lora-r / --lora-alpha (alpha defaults to 2*r),
+--save-embeddings / --no-save-embeddings.
+
 Results land in outputs/<run-name>/{oof.csv,test_probs.csv,metrics.json}; adapters are
 saved to the `titanic-gemma4-runs` Modal volume under /runs/<run-name>/fold<k>/.
+
+Embeddings (default on): each fold model embeds its own VAL rows and all TEST rows (last-layer
+hidden state at the final prompt token; the pooled last-token state for --head classification).
+emb_oof.npy (891, H) holds each train row's embedding from the fold that never saw its label, in
+train PassengerId order; emb_test.npy (418, H) is the mean over folds; emb_ids.json lists the
+train/test id orders. They are an OOF-stacking input for the classical models: only use emb_oof
+as features inside the same CV that produced it, never fit a model on emb_oof and score
+emb_test from a different split of the labels.
 """
 
 from __future__ import annotations
@@ -40,7 +53,10 @@ from titanic.llm import (  # noqa: F401  (re-exported for tests)
     chat_prompt,
     resolve_trust_remote_code,
     is_attention_error,
+    last_token_index,
+    HEAD_NAME,
     load_causal_lm,
+    load_sequence_classifier,
     pick_label_tokens,
 )
 
@@ -56,6 +72,8 @@ DEFAULT_FOLDS = int(os.environ.get("FOLDS") or 5)
 DEFAULT_EPOCHS = int(os.environ.get("EPOCHS") or 3)
 DEFAULT_LR = float(os.environ.get("LR") or 1e-4)
 DEFAULT_SEED = int(os.environ.get("SEED") or 42)
+DEFAULT_SPLIT_SEED = 42
+HEADS = ("lm", "classification")
 DEFAULT_TRUST_REMOTE_CODE = (os.environ.get("TRUST_REMOTE_CODE") or "").lower() in ("1", "true", "yes")
 SMOKE_ROWS = 64
 SMOKE_FOLDS = 2
@@ -179,6 +197,11 @@ def build_metrics(
     results: list[dict],
     n_test: int,
     elapsed_seconds: float,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    head: str = "lm",
+    prompt_style: str = "prose",
+    save_embeddings: bool = False,
+    embedding_dim: int | None = None,
 ) -> dict:
     ordered = sorted(results, key=lambda r: r["fold"])
     return {
@@ -192,6 +215,11 @@ def build_metrics(
         "lora_r": lora_r,
         "lora_alpha": lora_alpha,
         "seed": seed,
+        "split_seed": split_seed,
+        "head": head,
+        "prompt_style": prompt_style,
+        "save_embeddings": save_embeddings,
+        "embedding_dim": embedding_dim,
         "smoke": smoke,
         "n_train": int(len(oof)),
         "n_test": int(n_test),
@@ -199,6 +227,36 @@ def build_metrics(
         "fold_accuracies": [r["val_accuracy"] for r in ordered],
         "elapsed_seconds": round(elapsed_seconds, 1),
     }
+
+
+def assemble_embeddings(results: list[dict], train_ids, test_ids) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Build emb_oof (train order, each row from the fold that held it out) and emb_test
+    (mean over folds) as float32 arrays, plus the id orders."""
+    train_order = [int(i) for i in train_ids]
+    test_order = [int(i) for i in test_ids]
+    position = {pid: k for k, pid in enumerate(train_order)}
+    emb_oof = None
+    seen: set[int] = set()
+    test_sum = None
+    for result in results:
+        val = np.asarray(result["val_emb"], dtype=np.float32)
+        ids = [int(i) for i in result["val_ids"]]
+        if len(val) != len(ids):
+            raise ValueError("Fold val embeddings do not match val ids")
+        if emb_oof is None:
+            emb_oof = np.full((len(train_order), val.shape[1]), np.nan, dtype=np.float32)
+        for pid, vec in zip(ids, val):
+            if pid in seen or pid not in position:
+                raise ValueError(f"Passenger {pid} is duplicated or not a train id")
+            seen.add(pid)
+            emb_oof[position[pid]] = vec
+        if [int(i) for i in result["test_ids"]] != test_order:
+            raise ValueError("Fold test ids do not match the test set order")
+        test = np.asarray(result["test_emb"], dtype=np.float32)
+        test_sum = test if test_sum is None else test_sum + test
+    if emb_oof is None or len(seen) != len(train_order):
+        raise ValueError("Embeddings do not cover every train row")
+    return emb_oof, test_sum / len(results), {"train_ids": train_order, "test_ids": test_order}
 
 
 def make_cfg(
@@ -214,8 +272,16 @@ def make_cfg(
     batch_size: int = 16,
     eval_batch_size: int = 16,
     trust_remote_code: bool = False,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    head: str = "lm",
+    prompt_style: str = "prose",
+    save_embeddings: bool = True,
 ) -> dict:
     return {
+        "split_seed": split_seed,
+        "head": head,
+        "prompt_style": prompt_style,
+        "save_embeddings": save_embeddings,
         "model_id": model_id,
         "run_name": run_name,
         "epochs": epochs,
@@ -273,7 +339,12 @@ def fit_and_score(
     from transformers import Trainer, TrainingArguments
 
     from titanic.lora import select_lora_targets
-    from titanic.text import QUESTION, SYSTEM_PROMPT, describe
+    from titanic.text import PROMPT_STYLES, QUESTION, SYSTEM_PROMPT
+
+    describe = PROMPT_STYLES[cfg.get("prompt_style", "prose")]
+    head = cfg.get("head", "lm")
+    classify = head == "classification"
+    want_emb = cfg.get("save_embeddings", True)
 
     output_dir = output_dir or tempfile.mkdtemp(prefix=f"trainer-fold{fold}-")
 
@@ -291,13 +362,16 @@ def fit_and_score(
     fit_prompts = encode_frame(fit_df)
     print(f"Example prompt:\n{tokenizer.decode(fit_prompts[0])}", flush=True)
     fit_labels = fit_df["Survived"].astype(int).tolist()
-    examples = [
-        {
-            "input_ids": ids + [label_ids[label]],
-            "labels": [-100] * len(ids) + [label_ids[label]],
-        }
-        for ids, label in zip(fit_prompts, fit_labels)
-    ]
+    if classify:  # plain cross-entropy over 2 classes at the last prompt token
+        examples = [{"input_ids": ids, "labels": label} for ids, label in zip(fit_prompts, fit_labels)]
+    else:
+        examples = [
+            {
+                "input_ids": ids + [label_ids[label]],
+                "labels": [-100] * len(ids) + [label_ids[label]],
+            }
+            for ids, label in zip(fit_prompts, fit_labels)
+        ]
 
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     forward_params = inspect.signature(model.forward).parameters
@@ -312,7 +386,11 @@ def fit_and_score(
         out = {
             "input_ids": input_ids,
             "attention_mask": pad_batch([[1] * len(b["input_ids"]) for b in batch], 0),
-            "labels": pad_batch([b["labels"] for b in batch], -100),
+            "labels": (
+                torch.tensor([b["labels"] for b in batch], dtype=torch.long)
+                if classify
+                else pad_batch([b["labels"] for b in batch], -100)
+            ),
         }
         for key in extra_zero_keys:
             out[key] = torch.zeros_like(input_ids)
@@ -320,13 +398,25 @@ def fit_and_score(
 
     targets = select_lora_targets([(n, type(m).__name__) for n, m in model.named_modules()])
     print(f"LoRA targets: {len(targets)}; examples: {targets[:3]}", flush=True)
+    native_cls = classify and type(model).__name__.endswith("ForSequenceClassification")
+    wrapper_cls = classify and not native_cls  # llm.make_last_token_classifier
+    lora_kwargs = {}
+    if classify:
+        # Keep the 2-way head fully trainable and saved with the adapter.
+        lora_kwargs["modules_to_save"] = [HEAD_NAME]
+    if not classify:
+        lora_kwargs["task_type"] = "CAUSAL_LM"
+    elif native_cls:
+        lora_kwargs["task_type"] = "SEQ_CLS"
+        if getattr(model.config, "pad_token_id", None) is None:
+            model.config.pad_token_id = pad_id
     lora_config = LoraConfig(
         r=cfg["lora_r"],
         lora_alpha=cfg["lora_alpha"],
         lora_dropout=cfg["lora_dropout"],
         target_modules=targets,
         bias="none",
-        task_type="CAUSAL_LM",
+        **lora_kwargs,
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
@@ -354,28 +444,43 @@ def fit_and_score(
     trainer.train()
 
     @torch.no_grad()
-    def score(prompts: list[list[int]]) -> list[float]:
-        """P(yes) from the logits at the last prompt token (right-padded, gathered by length)."""
+    def score(prompts: list[list[int]]) -> tuple[list[float], np.ndarray | None]:
+        """P(yes) (or softmax[:, 1] for the classification head) at the last prompt token, plus
+        that token's last-layer hidden state as float16 (right-padded, gathered by length)."""
         model.eval()
         probs: list[float] = []
+        embs: list[np.ndarray] = []
         size = cfg["eval_batch_size"]
         for start in range(0, len(prompts), size):
             chunk = prompts[start : start + size]
             input_ids = pad_batch(chunk, pad_id).to(device)
             attention_mask = pad_batch([[1] * len(c) for c in chunk], 0).to(device)
             extra = {k: torch.zeros_like(input_ids) for k in extra_zero_keys}
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, **extra).logits
-            last = torch.tensor([len(c) - 1 for c in chunk], device=logits.device)
-            at_answer = logits[torch.arange(len(chunk), device=logits.device), last]
-            pair = at_answer[:, label_ids].float()
+            if wrapper_cls:
+                out = model(input_ids=input_ids, attention_mask=attention_mask)
+                pair, hidden = out["logits"].float(), out["pooled"]
+            else:
+                out = model(
+                    input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=want_emb, **extra
+                )
+                last = last_token_index(attention_mask)
+                rows = torch.arange(len(chunk), device=out.logits.device)
+                if native_cls:  # logits are already pooled at the last non-pad token: (B, 2)
+                    pair = out.logits.float()
+                else:
+                    at_answer = out.logits[rows, last]
+                    pair = at_answer[:, label_ids].float()
+                hidden = out.hidden_states[-1][rows, last] if want_emb else None
             probs.extend(torch.softmax(pair, dim=-1)[:, 1].cpu().tolist())
-        return probs
+            if want_emb:
+                embs.append(hidden.float().cpu().numpy().astype(np.float16))
+        return probs, (np.concatenate(embs) if embs else np.zeros((0, 0), dtype=np.float16))
 
     val_ids = val_df["PassengerId"].astype(int).tolist()
-    val_probs = score(encode_frame(val_df)) if len(val_df) else []
+    val_probs, val_emb = score(encode_frame(val_df)) if len(val_df) else ([], None)
     val_accuracy = accuracy(val_df["Survived"], val_probs) if len(val_df) else None
     test_ids = test_df["PassengerId"].astype(int).tolist()
-    test_probs = score(encode_frame(test_df))
+    test_probs, test_emb = score(encode_frame(test_df))
     print(f"[fold {fold}] val_accuracy={val_accuracy}", flush=True)
 
     if save_dir:
@@ -390,6 +495,8 @@ def fit_and_score(
         "test_ids": test_ids,
         "test_probs": test_probs,
         "val_accuracy": val_accuracy,
+        "val_emb": val_emb,
+        "test_emb": test_emb,
     }
 
 
@@ -419,7 +526,7 @@ def train_fold(
     train_df, test_df = engineer(train_raw, test_raw)
 
     if fold >= 0:
-        splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+        splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=cfg.get("split_seed", DEFAULT_SPLIT_SEED))
         tr_idx, va_idx = list(splitter.split(train_df, train_df["Survived"]))[fold]
     else:
         tr_idx, va_idx = np.arange(len(train_df)), np.array([], dtype=int)
@@ -438,9 +545,10 @@ def train_fold(
         print(f"AutoTokenizer failed ({exc!r}); falling back to AutoProcessor.tokenizer")
         tokenizer = transformers.AutoProcessor.from_pretrained(model_id, trust_remote_code=trust).tokenizer
 
-    model, _ = load_causal_lm(
-        model_id, dtype=torch.bfloat16, trust_remote_code=cfg.get("trust_remote_code", False)
-    )
+    if cfg.get("head", "lm") == "classification":
+        model, _, _ = load_sequence_classifier(model_id, dtype=torch.bfloat16, trust_remote_code=trust)
+    else:
+        model, _ = load_causal_lm(model_id, dtype=torch.bfloat16, trust_remote_code=trust)
     model.to("cuda")
     print(f"Loaded {type(model).__name__}", flush=True)
 
@@ -479,8 +587,21 @@ def main(
     smoke: bool = False,
     seed: int = DEFAULT_SEED,
     trust_remote_code: bool = DEFAULT_TRUST_REMOTE_CODE,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    head: str = "lm",
+    prompt_style: str = "prose",
+    lora_r: int = 16,
+    lora_alpha: int = 0,
+    save_embeddings: bool = True,
 ):
     start = time.time()
+    if head not in HEADS:
+        raise SystemExit(f"--head must be one of {HEADS}, got {head!r}")
+    from titanic.text import PROMPT_STYLES
+
+    if prompt_style not in PROMPT_STYLES:
+        raise SystemExit(f"--prompt-style must be one of {tuple(PROMPT_STYLES)}, got {prompt_style!r}")
+    lora_alpha = lora_alpha or 2 * lora_r
     data_path = Path(data_dir)
     train_text = (data_path / "train.csv").read_text(encoding="utf-8")
     test_text = (data_path / "test.csv").read_text(encoding="utf-8")
@@ -501,10 +622,17 @@ def main(
         lr=lr,
         max_steps=max_steps,
         trust_remote_code=trust_remote_code,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        split_seed=split_seed,
+        head=head,
+        prompt_style=prompt_style,
+        save_embeddings=save_embeddings,
     )
     train_df = pd.read_csv(io.StringIO(train_text))
     test_df = pd.read_csv(io.StringIO(test_text))
-    print(f"Run {run_name}: {model_id} on {gpu}, {folds} folds, {epochs} epochs, lr {lr}")
+    print(f"Run {run_name}: {model_id} on {gpu}, {folds} folds, {epochs} epochs, lr {lr}, "
+          f"lora r={lora_r}/alpha={lora_alpha}, head={head}, prompt={prompt_style}, seed={seed}, split_seed={split_seed}")
 
     weights_path = prefetch_model.remote(model_id)
     print(f"Model weights cached at {weights_path}")
@@ -514,6 +642,11 @@ def main(
 
     oof = assemble_oof(results, train_df["PassengerId"])
     test_probs = average_test_probs(results, test_df["PassengerId"])
+    emb_arrays = None
+    embedding_dim = None
+    if save_embeddings:
+        emb_arrays = assemble_embeddings(results, train_df["PassengerId"], test_df["PassengerId"])
+        embedding_dim = int(emb_arrays[0].shape[1])
     metrics = build_metrics(
         run_name=run_name,
         model_id=model_id,
@@ -530,12 +663,21 @@ def main(
         results=results,
         n_test=len(test_df),
         elapsed_seconds=time.time() - start,
+        split_seed=split_seed,
+        head=head,
+        prompt_style=prompt_style,
+        save_embeddings=save_embeddings,
+        embedding_dim=embedding_dim,
     )
 
     out_dir = Path("outputs") / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     oof.to_csv(out_dir / "oof.csv", index=False)
     test_probs.to_csv(out_dir / "test_probs.csv", index=False)
+    if emb_arrays is not None:
+        np.save(out_dir / "emb_oof.npy", emb_arrays[0])
+        np.save(out_dir / "emb_test.npy", emb_arrays[1])
+        (out_dir / "emb_ids.json").write_text(json.dumps(emb_arrays[2]), encoding="utf-8")
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     print(f"\nFold accuracies: {[round(a, 4) for a in metrics['fold_accuracies']]}")

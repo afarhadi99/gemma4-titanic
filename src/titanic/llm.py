@@ -105,3 +105,109 @@ def resolve_trust_remote_code(model_id: str, requested: bool = False, log=print)
         why = "requested" if requested else "allowlisted"
         log(f"WARNING: trust_remote_code=True for {model_id} ({why}); executing code from the model repo")
     return trusted
+
+
+# --------------------------------------------------------------------------- #
+# Classification head (--head classification)
+# --------------------------------------------------------------------------- #
+
+HEAD_NAME = "score"  # attribute name of the trainable Linear(hidden, 2) head
+EXTRA_ZERO_KEYS = ("mm_token_type_ids", "token_type_ids")
+
+
+def last_token_index(attention_mask):
+    """Index of the last attended (non-pad) token per row; works for left or right padding."""
+    import torch
+
+    positions = torch.arange(attention_mask.shape[1], device=attention_mask.device)
+    return (attention_mask.long() * positions).argmax(dim=1)
+
+
+def make_last_token_classifier(backbone, num_labels: int = 2):
+    """Wrap a causal / conditional-generation LM as a sequence classifier.
+
+    Used for models (e.g. Gemma 4) that have no AutoModelForSequenceClassification mapping.
+    The backbone's decoder (no lm_head) gives hidden states; the last non-pad token's final
+    hidden state feeds `Linear(hidden, num_labels)` (fp32, `HEAD_NAME`). `forward` returns a
+    dict with `loss` (plain cross-entropy when `labels` is given), `logits` and `pooled`
+    (the last-token hidden state, reused as an embedding), so it works with Trainer and,
+    wrapped by PEFT with modules_to_save=[HEAD_NAME], save_pretrained also stores the head."""
+    import inspect
+
+    import torch
+    from torch import nn
+
+    class LastTokenClassifier(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = backbone
+            self.config = backbone.config
+            hidden = backbone.config.get_text_config().hidden_size
+            self.num_labels = num_labels
+            head = nn.Linear(hidden, num_labels)
+            nn.init.normal_(head.weight, std=0.02)
+            nn.init.zeros_(head.bias)
+            device = next(backbone.parameters()).device
+            setattr(self, HEAD_NAME, head.to(device=device, dtype=torch.float32))
+            prefix = getattr(backbone, "base_model_prefix", "")
+            self.inner = getattr(backbone, prefix, None) if prefix else None
+            target = self.inner if self.inner is not None else backbone
+            self._extra_keys = [k for k in EXTRA_ZERO_KEYS if k in inspect.signature(target.forward).parameters]
+
+        def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            extra = {k: kwargs.get(k, torch.zeros_like(input_ids)) for k in self._extra_keys}
+            if self.inner is not None:
+                out = self.inner(input_ids=input_ids, attention_mask=attention_mask, **extra)
+                hidden = out.last_hidden_state
+            else:
+                out = self.backbone(
+                    input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **extra
+                )
+                hidden = out.hidden_states[-1]
+            last = last_token_index(attention_mask)
+            pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), last]
+            head = getattr(self, HEAD_NAME)
+            logits = head(pooled.to(head.weight.dtype))
+            result = {"logits": logits, "pooled": pooled}
+            if labels is not None:
+                result["loss"] = nn.functional.cross_entropy(logits.float(), labels.to(logits.device))
+            return result
+
+    return LastTokenClassifier()
+
+
+def native_seq_cls_supported(config) -> bool:
+    """True when transformers has an AutoModelForSequenceClassification mapping for `config`."""
+    try:
+        from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING_NAMES as names
+    except ImportError:
+        return False
+    return getattr(config, "model_type", None) in names
+
+
+def load_sequence_classifier(model_id: str, *, dtype, config=None, trust_remote_code: bool = False, log=print):
+    """Load a 2-label sequence classifier. Prefers AutoModelForSequenceClassification when the
+    architecture is mapped; otherwise wraps the causal LM (see make_last_token_classifier).
+
+    Returns (model, description, kind) with kind "native" or "wrapper"."""
+    import transformers
+
+    cfg = config
+    if cfg is None:
+        cfg = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    if native_seq_cls_supported(cfg):
+        try:
+            kwargs = dict(dtype=dtype, num_labels=2, trust_remote_code=trust_remote_code)
+            if config is None:
+                model = transformers.AutoModelForSequenceClassification.from_pretrained(model_id, **kwargs)
+            else:
+                model = transformers.AutoModelForSequenceClassification.from_config(config, **kwargs)
+            return model, "AutoModelForSequenceClassification", "native"
+        except Exception as exc:
+            log(f"AutoModelForSequenceClassification failed ({exc!r}); wrapping the causal LM instead")
+    else:
+        log(f"No SequenceClassification mapping for {getattr(cfg, 'model_type', '?')}; wrapping the causal LM")
+    backbone, desc = load_causal_lm(model_id, dtype=dtype, config=config, trust_remote_code=trust_remote_code, log=log)
+    return make_last_token_classifier(backbone), f"LastTokenClassifier({desc})", "wrapper"

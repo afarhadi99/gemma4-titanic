@@ -42,6 +42,10 @@ def collect_rows(outputs_dir: Path, train_csv: Path | None = None) -> list[dict]
                 "oof_acc": m.get("oof_accuracy"),
                 "fold_mean": float(np.mean(folds)) if folds else None,
                 "fold_std": float(np.std(folds)) if folds else None,
+                "split_seed": m.get("split_seed"),
+                "seed": m.get("seed"),
+                "head": m.get("head"),
+                "prompt_style": m.get("prompt_style"),
                 "epochs": m.get("epochs"),
                 "lr": m.get("lr"),
                 "lora_r": m.get("lora_r"),
@@ -53,8 +57,14 @@ def collect_rows(outputs_dir: Path, train_csv: Path | None = None) -> list[dict]
     return sorted(rows, key=lambda r: -(r["oof_acc"] or 0))
 
 
+OPTIONAL_COLS = ("split_seed", "seed", "head", "prompt_style")
+
+
 def format_table(rows: list[dict]) -> str:
-    cols = ["run", "model_id", "oof_acc", "fold_mean", "fold_std", "epochs", "lr", "lora_r", "logloss", "auc", "seconds"]
+    # Optimisation columns only appear when at least one run recorded them.
+    cols = ["run", "model_id", "oof_acc", "fold_mean", "fold_std"]
+    cols += [c for c in OPTIONAL_COLS if any(r.get(c) is not None for r in rows)]
+    cols += ["epochs", "lr", "lora_r", "logloss", "auc", "seconds"]
 
     def fmt(v):
         if v is None:
@@ -63,7 +73,7 @@ def format_table(rows: list[dict]) -> str:
             return f"{v:.4g}" if abs(v) < 1 and v != 0 and v < 0.001 else f"{v:.4f}" if v < 100 else f"{v:.0f}"
         return str(v)
 
-    table = [cols] + [[fmt(r[c]) for c in cols] for r in rows]
+    table = [cols] + [[fmt(r.get(c)) for c in cols] for r in rows]
     widths = [max(len(row[i]) for row in table) for i in range(len(cols))]
     return "\n".join("  ".join(cell.ljust(w) for cell, w in zip(row, widths)) for row in table)
 
