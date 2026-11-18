@@ -136,6 +136,12 @@ Lessons:
 - Only letting a model overturn the rules when it is very confident (Gemma, p > 0.8 or < 0.2) added one more correct public passenger.
 - Scores near 1.0 on this leaderboard come from looking up the public passenger list, not from modelling.
 
+### Refining WCG (`make refine`)
+
+`make refine REF=submissions/wcg_h3.csv MODEL_RUNS="outputs/a outputs/b"` evaluates a small pre-declared grid (at most 23 variants, nothing tuned beyond it): group keys (`a` current, `b` Deotte name-only, `c` surname + Pclass + port), rate-based woman/boy thresholds (`--woman-rate`, `--boy-rate`), the large 3rd-class family rule (`--class3-large`), and model flips restricted to plain-default segments (`--model-segments`, `--flip-hi/--flip-lo`). Each variant is cross-validated honestly (5 folds x seeds 42/7/123, validation labels hidden, groups from fit labels only) and written, validated, to `submissions/refine/<name>.csv`; `submissions/refine/summary.csv` holds CV mean/std, seed-42 CV, and how many test passengers differ from `REF` and from pure WCG. Variants that use a model only have the OOF of split seed 42, so they are compared on seed 42.
+
+Selection rule: a variant is marked `candidate` only if its CV mean is at least the reference config's (same code path, same seeds) AND it differs from `REF` on 2-15 test passengers. We submit only candidates, and keep a new one only if its public score beats 0.80382. CV is a filter, not a proof: it did not predict the leaderboard before.
+
 Group features lifted Gemma from 0.8373 to 0.8496 OOF, but it still trails the classical vote, so the blend keeps the baseline alone. To make Gemma earn weight, average 2-3 Gemma runs with different `--seed` values or try `--model-id google/gemma-4-E4B-it`.
 
 OOF is the guide. The public leaderboard scores only about 209 passengers, so expect roughly 0.78-0.81 there; an honest 0.80+ is a strong score. Perfect 1.0 scores on the leaderboard come from looking up the public passenger list, not from modelling.

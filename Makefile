@@ -2,12 +2,14 @@
 MSG ?= gemma4-titanic submission
 MODEL ?=
 MODELS ?=
+REF ?=
+MODEL_RUNS ?=
 EMB ?=
 TRUST_REMOTE_CODE ?=
 GEMMA ?= google/gemma-4-E2B-it
 PY ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
 
-.PHONY: help setup install env check data test baseline baseline-emb stack wcg tabpfn smoke train train-all sweep seeds variants compare ensemble submit clean-outputs
+.PHONY: help setup install env check data test baseline baseline-emb stack wcg refine tabpfn smoke train train-all sweep seeds variants compare ensemble submit clean-outputs
 
 help:
 	@echo "Targets:"
@@ -22,6 +24,7 @@ help:
 	@echo "  baseline-emb   baseline plus gb+emb/svc+emb candidates (EMB=outputs/<run> with emb_oof.npy)"
 	@echo "  stack          logistic-regression stack of outputs/* with nested CV -> submissions/stack.csv"
 	@echo "  wcg            Woman-Child-Group rules + hybrids with outputs/baseline -> submissions/wcg*.csv (NEARBY=1 adds nearby-ticket links)"
+	@echo "  refine         WCG refinement grid -> submissions/refine/ (REF=<submission.csv> MODEL_RUNS=\"outputs/a outputs/b\")"
 	@echo "  smoke          cheap end-to-end run on Modal (MODEL=org/name to override)"
 	@echo "  train          full LoRA run on Modal (MODEL=org/name to override)"
 	@echo "  train-all      smoke then train each of MODELS=\"a b c\" in turn, continue past failures"
@@ -67,6 +70,9 @@ stack:
 
 wcg:
 	$(PY) wcg.py $(if $(NEARBY),--nearby)
+
+refine:
+	$(PY) wcg.py --grid $(if $(REF),--reference $(REF)) $(foreach r,$(MODEL_RUNS),--model-run $(r))
 
 smoke: env
 	$(PY) -m modal run modal_app.py --smoke $(if $(MODEL),--model-id $(MODEL)) $(if $(TRUST_REMOTE_CODE),--trust-remote-code)
