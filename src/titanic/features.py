@@ -22,6 +22,19 @@ NUMERIC_COLS = [
 ]
 CATEGORICAL_COLS = ["Sex", "Embarked", "Title", "Deck"]
 
+# Optional engineered columns, grouped so each group can be switched on or off (see baseline.py).
+# group name -> (numeric columns, categorical columns). All are computed by engineer() from
+# label-free inputs, except "wcg", which add_group_features() derives from fit labels only.
+FEATURE_GROUPS: dict[str, tuple[list[str], list[str]]] = {
+    "ticket": ([], ["TicketPrefix", "TicketNumBucket"]),
+    "cabin": (["CabinNumber", "CabinCount"], ["CabinSide"]),
+    "deckpclass": ([], ["DeckPclass"]),
+    "farerel": (["FareRel"], []),
+    "titlepclass": ([], ["TitlePclass"]),
+    "wcg": (["WcgAllDied", "WcgAnySurvived"], []),
+}
+MIN_PREFIX_COUNT = 8  # rarer ticket prefixes collapse into "OTHER"
+
 
 def load_raw(data_dir: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     data_dir = Path(data_dir)
@@ -55,7 +68,37 @@ def _engineer_combined(df: pd.DataFrame) -> pd.DataFrame:
     out["Deck"] = df["Cabin"].fillna("U").str[0].str.upper()
     out["TicketGroupSize"] = df.groupby("Ticket")["Ticket"].transform("size")
     out["FarePerPerson"] = out["Fare"] / out["TicketGroupSize"]
+    _add_optional_columns(df, out)
     return out
+
+
+def _ticket_parts(ticket: str) -> tuple[str, str]:
+    """(normalised letter prefix or "NUM", digit-count bucket of the trailing number)."""
+    tokens = ticket.strip().split()
+    number = tokens[-1] if tokens and tokens[-1].isdigit() else ""
+    head = " ".join(tokens[:-1]) if number else " ".join(tokens)
+    prefix = re.sub(r"[^A-Za-z]", "", head).upper() or "NUM"
+    return prefix, f"d{len(number)}" if number else "none"
+
+
+def _add_optional_columns(df: pd.DataFrame, out: pd.DataFrame) -> None:
+    parts = df["Ticket"].fillna("").astype(str).map(_ticket_parts)
+    prefix = parts.str[0]
+    rare = prefix.map(prefix.value_counts()) < MIN_PREFIX_COUNT
+    out["TicketPrefix"] = prefix.where(~rare, "OTHER")
+    out["TicketNumBucket"] = parts.str[1]
+
+    cabin = df["Cabin"].fillna("").astype(str).str.strip()
+    out["CabinCount"] = cabin.map(lambda c: len(c.split()) if c else 0)
+    number = cabin.str.extract(r"(\d+)", expand=False)
+    out["CabinNumber"] = pd.to_numeric(number, errors="coerce").fillna(0).astype(float)
+    side = np.where(number.isna(), "none", np.where(out["CabinNumber"] % 2 == 1, "odd", "even"))
+    out["CabinSide"] = side
+
+    out["DeckPclass"] = out["Deck"] + "_" + df["Pclass"].astype(int).astype(str)
+    class_median = out.groupby(df["Pclass"])["FarePerPerson"].transform("median")
+    out["FareRel"] = out["FarePerPerson"] / class_median.where(class_median > 0, 1.0)
+    out["TitlePclass"] = out["Title"] + "_" + df["Pclass"].astype(int).astype(str)
 
 
 def engineer(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -71,7 +114,18 @@ def engineer(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame, pd.
     return attach(train, features.iloc[:n_train]), attach(test, features.iloc[n_train:])
 
 
-GROUP_COLS = ["GroupSize", "GroupKnownCount", "GroupKnownSurvived", "GroupSurvivalRate", "GroupNoKnown"]
+GROUP_COLS = [
+    "GroupSize",
+    "GroupKnownCount",
+    "GroupKnownSurvived",
+    "GroupSurvivalRate",
+    "GroupNoKnown",
+    "GroupWcKnown",
+    "GroupWcSurvived",
+    "WcgAllDied",
+    "WcgAnySurvived",
+]
+WC_TITLES = frozenset({"Mrs", "Miss", "Master"})  # women and boys
 
 
 def _group_keys(df: pd.DataFrame) -> pd.Series:
@@ -121,6 +175,21 @@ def add_group_features(
     )
     stats["GroupSurvivalRate"] = np.where(count > 0, wins / np.maximum(count, 1), np.nan)
     stats["GroupNoKnown"] = (count == 0).astype(int)
+
+    # Women-and-children group (WCG) rule: among the other known women/boys of the group, did all
+    # die (WcgAllDied) or did any survive (WcgAnySurvived)? Same leave-one-out treatment.
+    is_wc = combined["Name"].fillna("").map(extract_title).isin(WC_TITLES).to_numpy(dtype=float)
+    wc_labels = is_wc[:n_fit] * labels
+    wc_known = pd.Series(is_wc[:n_fit], index=fit_keys.index).groupby(fit_keys.to_numpy()).sum()
+    wc_surv = pd.Series(wc_labels, index=fit_keys.index).groupby(fit_keys.to_numpy()).sum()
+    wc_count = keys.map(wc_known).fillna(0.0).to_numpy().copy()
+    wc_wins = keys.map(wc_surv).fillna(0.0).to_numpy().copy()
+    wc_count[:n_fit] -= is_wc[:n_fit]
+    wc_wins[:n_fit] -= wc_labels
+    stats["GroupWcKnown"] = wc_count.astype(int)
+    stats["GroupWcSurvived"] = wc_wins.astype(int)
+    stats["WcgAllDied"] = ((wc_count > 0) & (wc_wins == 0)).astype(int)
+    stats["WcgAnySurvived"] = (wc_wins > 0).astype(int)
 
     outputs: list[pd.DataFrame] = []
     start = 0

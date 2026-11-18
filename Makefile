@@ -2,11 +2,12 @@
 MSG ?= gemma4-titanic submission
 MODEL ?=
 MODELS ?=
+EMB ?=
 TRUST_REMOTE_CODE ?=
 GEMMA ?= google/gemma-4-E2B-it
 PY ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
 
-.PHONY: help setup install env check data test baseline smoke train train-all sweep seeds variants compare ensemble submit clean-outputs
+.PHONY: help setup install env check data test baseline baseline-emb stack tabpfn smoke train train-all sweep seeds variants compare ensemble submit clean-outputs
 
 help:
 	@echo "Targets:"
@@ -16,7 +17,10 @@ help:
 	@echo "  check          verify .env keys and Modal/Kaggle auth"
 	@echo "  data           download Titanic data from Kaggle into data/"
 	@echo "  test           run pytest"
-	@echo "  baseline       run the classical baseline into outputs/baseline"
+	@echo "  tabpfn         TabPFN + TabICL on a Modal GPU -> outputs/tabpfn, outputs/tabicl (run before baseline)"
+	@echo "  baseline       run the classical baseline into outputs/baseline (uses outputs/tabpfn|tabicl if present)"
+	@echo "  baseline-emb   baseline plus gb+emb/svc+emb candidates (EMB=outputs/<run> with emb_oof.npy)"
+	@echo "  stack          logistic-regression stack of outputs/* with nested CV -> submissions/stack.csv"
 	@echo "  smoke          cheap end-to-end run on Modal (MODEL=org/name to override)"
 	@echo "  train          full LoRA run on Modal (MODEL=org/name to override)"
 	@echo "  train-all      smoke then train each of MODELS=\"a b c\" in turn, continue past failures"
@@ -47,8 +51,18 @@ data: env
 test:
 	$(PY) -m pytest -q
 
+tabpfn: env
+	$(PY) -m modal run tabpfn_modal.py
+
 baseline:
 	$(PY) baseline.py
+
+baseline-emb:
+	@test -n "$(EMB)" || { echo 'Usage: make baseline-emb EMB=outputs/<run>' >&2; exit 1; }
+	$(PY) baseline.py --embeddings $(EMB)
+
+stack:
+	$(PY) stack.py
 
 smoke: env
 	$(PY) -m modal run modal_app.py --smoke $(if $(MODEL),--model-id $(MODEL)) $(if $(TRUST_REMOTE_CODE),--trust-remote-code)

@@ -2,7 +2,7 @@
 
 Kaggle [Titanic](https://www.kaggle.com/c/titanic) with a classical baseline and a Gemma 4 model fine-tuned with LoRA on [Modal](https://modal.com) GPUs. Out-of-fold (OOF) accuracy decides which models go into the final submission.
 
-- **Baseline**: engineered features plus leak-free family/ticket group features; logistic regression, HGB, gradient boosting, random forest, SVC, CatBoost, XGBoost, LightGBM, TabPFN and TabICL, with the best single model or soft-vote average picked by OOF. 5-fold CV, runs locally in seconds.
+- **Baseline**: engineered features plus leak-free family/ticket group features; logistic regression, HGB, gradient boosting, random forest, SVC, CatBoost, XGBoost and LightGBM locally, plus TabPFN and TabICL computed on a Modal GPU (`make tabpfn`). The best single model or soft-vote average is picked by OOF accuracy averaged over three CV split seeds (5 folds each). Runs locally in about a minute without TabPFN/TabICL.
 - **Gemma 4 LoRA classifier**: each passenger becomes a short English description and the model answers `yes`/`no`. The prediction is a softmax over the two label-token logits, trained K-fold on Modal.
 - **Ensemble**: grid-search blend weights (step 0.1, threshold fixed at 0.5 unless `--tune-threshold`) on OOF probabilities, then write and validate `submissions/submission.csv`.
 
@@ -48,10 +48,11 @@ Downloads `titanic.zip` into `data/` and unzips it. Success: `data/train.csv: 89
 
 ```bash
 make test
+make tabpfn      # optional, Modal GPU: TabPFN + TabICL -> outputs/tabpfn, outputs/tabicl
 make baseline
 ```
 
-`make test` runs pytest (all green). `make baseline` writes `outputs/baseline/{oof.csv,test_probs.csv,metrics.json}` and `submissions/baseline.csv`, and prints OOF accuracy per candidate model. It takes seconds. On the real data with group features the chosen model was `avg:gb+svc+rf` with OOF 0.8563 (see Results so far).
+`make test` runs pytest (all green). `make baseline` writes `outputs/baseline/{oof.csv,test_probs.csv,metrics.json}` and `submissions/baseline.csv`, and prints OOF accuracy per candidate model. It takes about a minute and scores every candidate with CV seeds 42, 7 and 123 (`--cv-seeds`); `oof.csv` comes from split seed 42 so it stays aligned with the LLM runs. `make tabpfn` runs TabPFN and TabICL on an L4 (about 1-2 minutes, a few cents) with the identical per-fold pipeline (`src/titanic/tabular.py`), one GPU call per seed in parallel, and writes normal run directories. Run it before `make baseline` and the baseline picks them up as precomputed candidates (when the seeds, folds and feature groups match) so the soft-vote can include them; without them it prints `run make tabpfn first` and carries on. With a local GPU you can fit them in-process instead: `BASELINE_MODELS=gb,svc,rf,tabpfn python baseline.py`. On the real data with group features the chosen model was `avg:gb+svc+rf` with OOF 0.8563 (see Results so far).
 
 ## Step 6: smoke test on Modal
 
@@ -125,6 +126,22 @@ OOF is the guide. The public leaderboard scores only about 209 passengers, so ex
 
 - **Group features** (`add_group_features` in `src/titanic/features.py`): passengers are grouped by shared ticket, else by surname + fare. For each passenger the group size and survival statistics of the other group members are computed from training-fold labels only (leave-one-out for training rows, so a row never sees its own label). The same facts are written into Gemma's prompt, so the LLM sees them too.
 - **More tabular candidates** (all inside each CV fold, group features from fit labels only, one fixed small-data config each, not tuned on OOF): CatBoost, XGBoost and LightGBM use native categorical columns (Sex, Embarked, Title, Deck; Pclass too for CatBoost), and the pretrained tabular foundation models TabPFN and TabICLv2 get the raw features with no one-hot and no scaling (categoricals as integer codes for TabPFN). The soft-vote considers them like any other model. Restrict candidates with `BASELINE_MODELS=gb,svc,rf` or `python baseline.py --models gb svc rf`.
+- **Repeated CV for decisions**: every keep/drop decision uses the mean over three 5-fold CV split seeds (42, 7, 123), not one split; single-split differences of 0.002 are noise (std over seeds is about 0.003-0.005).
+- **Extra features tried** (`FEATURE_GROUPS` in `src/titanic/features.py`, switch with `--features`). Rule: keep a group only if it improves the 3-seed mean by at least 0.002 without hurting the other model. Public Titanic train set, mean over 3 seeds, `gb` and the vote `tabpfn+gb`:
+
+| Feature group | gb | vote tabpfn+gb | Decision |
+| --- | --- | --- | --- |
+| none (reference) | 0.8485 | 0.8563 | |
+| ticket prefix + number bucket | 0.8470 | 0.8575 | dropped (gb worse) |
+| cabin number, side, count | 0.8507 | 0.8515 | dropped (vote -0.005) |
+| deck x pclass | 0.8507 | 0.8552 | dropped (vote worse) |
+| fare per person / class median | 0.8504 | 0.8563 | dropped (+0.002 on gb only, vote flat) |
+| title x pclass | 0.8507 | 0.8545 | dropped (vote worse) |
+| refined women-and-children rule (`wcg`, fold-aware leave-one-out) | 0.8466 | 0.8537 | dropped (both worse) |
+
+  None passed, so the default feature set is unchanged; the columns stay available behind `--features`.
+- **LLM embeddings as features** (`--embeddings outputs/<run>` or `make baseline-emb EMB=outputs/<run>`): a modal_app run saves `emb_oof.npy`, `emb_test.npy`, `emb_ids.json`. Inside each CV fold a 16-component PCA is fitted on the fit rows only and appended for the `logreg+emb`, `gb+emb`, `svc+emb` candidates. Caveat: the embeddings are out-of-fold outputs of one 5-fold LLM run, so stacking them in a fresh CV is the standard, slightly optimistic stacking setup.
+- **Stacking** (`make stack`, `stack.py`): takes every complete non-smoke run under `outputs/` (split seed 42, aligned by PassengerId), uses the logit of each run's probability as features and fits a logistic regression whose C is tuned by an inner 5-fold CV (log-loss, grid 0.01-10). The honest score is nested CV: outer 5-fold x seeds 42, 7, 123 with the inner tuning repeated inside each outer fold. It prints best single run, the `ensemble.py` blend, the mean of the top-k runs (both ranked/tuned on the same OOF, so optimistic) and the nested stack, and writes `submissions/stack.csv` (validated) and `submissions/stack.json` (runs, coefficients, C, nested accuracy). `--group-same-model` averages runs of the same model (e.g. Gemma seeds) first. Same stacking caveat as above: the base OOFs come from one fixed split.
 - **Model soft-vote**: `baseline.py` also scores averages of the best 2 and best 3 single models and keeps whichever has the best OOF; `ensemble.py` then blends the baseline with the Gemma runs.
 
 ## Running locally instead of Codespaces
@@ -151,7 +168,7 @@ The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `sc
 - Prompt wording: `src/titanic/text.py` (`SYSTEM_PROMPT`, `QUESTION`, `describe`).
 - More folds or other seeds: `--folds`, `--seed`, then ensemble the extra runs.
 - Average 2-3 Gemma runs with different `--seed`.
-- **TabPFN** (`TABPFN_VERSION` / `TABPFN_TOKEN` in `.env`): `v2` weights download with no login and are the default. `v3.5-fast` and `v3.5` weights are under a **non-commercial license**: fine for Kaggle's Titanic learning competition, but not for commercial use. Accept the license at https://ux.priorlabs.ai and put the token it gives you in `TABPFN_TOKEN` (the default version becomes `v3.5-fast`). Without a token, v3.5 is skipped with a one-line message. TabICLv2 (`tabicl`, BSD-3 code and weights from the `jingang/TabICL` Hugging Face repo) is permissive and needs no login. torch is installed from the CPU-only wheel index (see `requirements.txt`), so Codespaces does not pull CUDA.
+- **TabPFN** (`TABPFN_VERSION` / `TABPFN_TOKEN` in `.env`): `v2` weights download with no login and are the default. `v3.5-fast` and `v3.5` weights are under a **non-commercial license**: fine for Kaggle's Titanic learning competition, but not for commercial use. Accept the license at https://ux.priorlabs.ai and put the token it gives you in `TABPFN_TOKEN` (the default version becomes `v3.5-fast`). Without a token, v3.5 is skipped with a one-line message. TabICLv2 (`tabicl`, BSD-3 code and weights from the `jingang/TabICL` Hugging Face repo) is permissive and needs no login. TabPFN and TabICL run on a Modal GPU through `make tabpfn` (`tabpfn_modal.py`, default GPU L4, override with `TABPFN_GPU`; the token is forwarded as a Modal secret and weights are cached in the `tabpfn-cache` volume). The local torch is the CPU-only wheel (see `requirements.txt`), so Codespaces does not pull CUDA; it is only needed for the optional local fit.
 - Try `--model-id google/gemma-4-E4B-it`.
 - Other models (same prompt, folds, epochs, lr and LoRA settings; only attention, label tokens, LoRA target names and chat-template kwargs adapt automatically):
 
@@ -190,9 +207,11 @@ A full run is 5 folds x about 6 minutes on A100, well under $2; a smoke run is c
 
 ```
 baseline.py            classical CV models -> outputs/baseline/
+tabpfn_modal.py        TabPFN + TabICL on a Modal GPU -> outputs/tabpfn/, outputs/tabicl/
+stack.py               nested-CV logistic stack of outputs/* -> submissions/stack.csv
 ensemble.py            blend outputs/*/ -> submissions/submission.csv
 modal_app.py           Modal LoRA training and inference
-src/titanic/           features, text prompts, submission I/O, LoRA target selection, .env loader
+src/titanic/           features, tabular (shared folds, feature matrices, models), text prompts, submission I/O, LoRA target selection, .env loader
 scripts/               download_data, submit, check_env (.sh primary, .ps1 for Windows)
 tests/                 pytest suite and synthetic fixtures
 .env.example           template for the single .env config file (.env is gitignored)

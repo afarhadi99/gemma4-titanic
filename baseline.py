@@ -1,159 +1,43 @@
 import argparse
 import json
 import os
-import warnings
+import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.base import ClassifierMixin
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.svm import SVC
+from sklearn.decomposition import PCA  # noqa: F401  (kept importable from baseline)
 
 from titanic.env import load_env
-from titanic.features import CATEGORICAL_COLS, NUMERIC_COLS, add_group_features, engineer, load_raw
+from titanic.features import FEATURE_GROUPS, engineer, load_raw
 from titanic.submission import validate_submission, write_submission
+from titanic.tabular import (  # noqa: F401  (re-exported: tests and tools import these from baseline)
+    ACTIVE_FEATURES,
+    BASE_MODELS,
+    DEFAULT_FEATURES,
+    EXTRA_MODELS,
+    FrameModel,
+    TABPFN_VERSIONS,
+    accuracy,
+    cross_validate,
+    emb_components,
+    feature_cols,
+    fit_predict_full,
+    fold_matrices,
+    make_model,
+    model_matrix,
+    set_features,
+    tabpfn_version,
+    with_emb,
+)
 
-warnings.filterwarnings("ignore", message=".*probability.*", category=FutureWarning)
-
-GROUP_NUMERIC_COLS = ["GroupSize", "GroupKnownCount", "GroupRate", "GroupNoKnown"]
-BASE_MODELS = ["logreg", "hgb", "gb", "rf", "svc"]
-EXTRA_MODELS = ["catboost", "xgboost", "lightgbm", "tabpfn", "tabicl"]
 ALL_MODELS = BASE_MODELS + EXTRA_MODELS
-TABPFN_VERSIONS = ("v2", "v3.5-fast", "v3.5")
-OLD_MODELS = ["logreg", "hgb"]
-GROUP_PRIOR = 2.0  # pseudo-observations at 0.5 when smoothing the group survival rate
-
-
-def feature_cols(use_group: bool) -> tuple[list[str], list[str]]:
-    return NUMERIC_COLS + (GROUP_NUMERIC_COLS if use_group else []), CATEGORICAL_COLS
-
-
-def tabpfn_version() -> str:
-    """TABPFN_VERSION from the environment; default v3.5-fast with a token, else v2 (no login needed)."""
-    default = "v3.5-fast" if os.environ.get("TABPFN_TOKEN") else "v2"
-    return os.environ.get("TABPFN_VERSION", "").strip() or default
-
-
-class FrameModel:
-    """Tabular models that take raw categorical columns (no one-hot, no scaling).
-
-    CatBoost, XGBoost and LightGBM use their native categorical support, TabPFN gets integer
-    codes plus `categorical_features_indices`, TabICL gets the DataFrame itself.
-    """
-
-    def __init__(self, kind: str, seed: int, numeric: list[str], categorical: list[str]):
-        self.kind, self.seed, self.numeric, self.categorical = kind, seed, numeric, categorical
-
-    def _prep(self, x: pd.DataFrame) -> pd.DataFrame:
-        x = x[self.num_ + self.cat_].copy()
-        if self.kind == "catboost":
-            x["Pclass"] = x["Pclass"].astype(int).astype(str)
-            return x
-        if self.kind in ("xgboost", "lightgbm"):
-            for col in self.cat_:
-                x[col] = x[col].astype(str).astype(pd.CategoricalDtype(self.categories_[col]))  # unseen -> NaN
-            return x
-        if self.kind == "tabpfn":
-            x[self.cat_] = self.encoder_.transform(x[self.cat_].astype(str))
-            return x.astype(float)
-        for col in self.cat_:  # tabicl encodes object columns itself
-            x[col] = x[col].astype(str).astype(object)
-        return x
-
-    def fit(self, x: pd.DataFrame, y: np.ndarray) -> "FrameModel":
-        from sklearn.preprocessing import OrdinalEncoder
-
-        seed = self.seed
-        self.num_, self.cat_ = list(self.numeric), list(self.categorical)
-        if self.kind == "catboost":  # Pclass is categorical for CatBoost
-            self.num_.remove("Pclass")
-            self.cat_.append("Pclass")
-        self.categories_ = {c: sorted(x[c].astype(str).unique()) for c in self.cat_}
-        if self.kind == "tabpfn":
-            self.encoder_ = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1).fit(
-                x[self.cat_].astype(str)
-            )
-        if self.kind == "catboost":
-            from catboost import CatBoostClassifier
-
-            self.clf_ = CatBoostClassifier(
-                depth=5, iterations=600, learning_rate=0.03, l2_leaf_reg=4, random_seed=seed,
-                verbose=0, allow_writing_files=False, thread_count=1, one_hot_max_size=10,
-                cat_features=self.cat_,
-            )
-        elif self.kind == "xgboost":
-            from xgboost import XGBClassifier
-
-            self.clf_ = XGBClassifier(
-                max_depth=4, n_estimators=400, learning_rate=0.04, subsample=0.8, colsample_bytree=0.8,
-                enable_categorical=True, tree_method="hist", random_state=seed, n_jobs=1,
-            )
-        elif self.kind == "lightgbm":
-            from lightgbm import LGBMClassifier
-
-            self.clf_ = LGBMClassifier(
-                num_leaves=12, min_child_samples=15, n_estimators=400, learning_rate=0.04,
-                subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=seed,
-                n_jobs=1, verbose=-1,
-            )
-        elif self.kind == "tabpfn":
-            from tabpfn import TabPFNClassifier
-            from tabpfn.constants import ModelVersion
-
-            version = ModelVersion(tabpfn_version())
-            self.clf_ = TabPFNClassifier.create_default_for_version(
-                version,
-                device="cpu",
-                random_state=seed,
-                categorical_features_indices=list(range(len(self.num_), len(self.num_) + len(self.cat_))),
-            )
-        else:
-            from tabicl import TabICLClassifier
-
-            self.clf_ = TabICLClassifier(random_state=seed, device="cpu")
-        self.clf_.fit(self._prep(x), y)
-        return self
-
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
-        return self.clf_.predict_proba(self._prep(x))
-
-
-def make_model(name: str, seed: int, use_group: bool = True) -> Pipeline | FrameModel:
-    numeric, categorical = feature_cols(use_group)
-    if name in EXTRA_MODELS:
-        return FrameModel(name, seed, numeric, categorical)
-    encoder = OneHotEncoder(handle_unknown="ignore")
-    scaled = ColumnTransformer([("num", StandardScaler(), numeric), ("cat", encoder, categorical)])
-    raw = ColumnTransformer([("num", "passthrough", numeric), ("cat", encoder, categorical)])
-    if name == "logreg":
-        return Pipeline([("prep", scaled), ("clf", LogisticRegression(C=0.5, max_iter=2000))])
-    if name == "svc":
-        return Pipeline([("prep", scaled), ("clf", SVC(C=1.0, probability=True, random_state=seed))])
-    if name == "rf":
-        clf: ClassifierMixin = RandomForestClassifier(
-            n_estimators=300, min_samples_leaf=3, max_features="sqrt", n_jobs=1, random_state=seed
-        )
-        return Pipeline([("prep", raw), ("clf", clf)])
-    if name == "gb":
-        clf = GradientBoostingClassifier(
-            n_estimators=100, max_depth=3, learning_rate=0.05, subsample=0.8, random_state=seed
-        )
-        return Pipeline([("prep", raw), ("clf", clf)])
-    clf = HistGradientBoostingClassifier(
-        max_depth=3,
-        learning_rate=0.05,
-        max_iter=150,
-        min_samples_leaf=5,
-        l2_regularization=1.0,
-        random_state=seed,
-    )
-    return Pipeline([("prep", raw), ("clf", clf)])
+# TabPFN and TabICL are slow on CPU: by default they are read from outputs/<name>/ (written by
+# `make tabpfn` on a Modal GPU). Add them to BASELINE_MODELS / --models to fit them locally instead.
+PRECOMPUTED_MODELS = ["tabpfn", "tabicl"]
+LOCAL_DEFAULT_MODELS = [m for m in ALL_MODELS if m not in PRECOMPUTED_MODELS]
+EMB_MODELS = ["logreg+emb", "gb+emb", "svc+emb"]  # base model + PCA of LLM embeddings (--embeddings)
+DEFAULT_CV_SEEDS = (42, 7, 123)
 
 
 def unavailable_reason(name: str) -> str | None:
@@ -177,17 +61,18 @@ def unavailable_reason(name: str) -> str | None:
     return None
 
 
-def resolve_models(requested: list[str] | None = None) -> list[str]:
+def resolve_models(requested: list[str] | None = None, with_emb: bool = False) -> list[str]:
     """Candidate list: `requested` (or BASELINE_MODELS, else all), minus models that cannot run here."""
     if not requested:
         env = os.environ.get("BASELINE_MODELS", "").replace(",", " ").split()
-        requested = env or ALL_MODELS
-    unknown = [n for n in requested if n not in ALL_MODELS]
+        requested = env or LOCAL_DEFAULT_MODELS + (EMB_MODELS if with_emb else [])
+    known = ALL_MODELS + EMB_MODELS
+    unknown = [n for n in requested if n not in known]
     if unknown:
-        raise SystemExit(f"Unknown model(s) {unknown}; choose from {ALL_MODELS}")
+        raise SystemExit(f"Unknown model(s) {unknown}; choose from {known}")
     names = []
     for name in requested:
-        reason = unavailable_reason(name)
+        reason = "needs --embeddings" if name.endswith("+emb") and not with_emb else unavailable_reason(name)
         if reason:
             print(f"Skipping {name}: {reason}")
         else:
@@ -197,69 +82,84 @@ def resolve_models(requested: list[str] | None = None) -> list[str]:
     return names
 
 
-def model_matrix(df: pd.DataFrame, use_group: bool = True) -> pd.DataFrame:
-    numeric, categorical = feature_cols(use_group)
-    x = df.copy()
-    if use_group:
-        n, wins = x["GroupKnownCount"], x["GroupKnownSurvived"]
-        x["GroupRate"] = (wins + 0.5 * GROUP_PRIOR) / (n + GROUP_PRIOR)
-    x = x[numeric + categorical].copy()
-    x[numeric] = x[numeric].astype(float)
-    return x
+def load_precomputed(
+    outputs_dir: Path, seeds: list[int], train: pd.DataFrame, test: pd.DataFrame, folds: int
+) -> dict[str, dict]:
+    """Candidates written by tabpfn_modal.py: {name: {"oof": {seed: probs}, "test": probs}}.
+
+    Used only if outputs/<name>/ has every requested seed's oof_seed<k>.csv, the same folds and the
+    same optional feature groups; otherwise one line says why and the candidate is left out."""
+    found: dict[str, dict] = {}
+    for name in PRECOMPUTED_MODELS:
+        run_dir = Path(outputs_dir) / name
+        metrics_path = run_dir / "metrics.json"
+        if not metrics_path.is_file():
+            print(f"Skipping {name}: no {run_dir}; run `make tabpfn` first")
+            continue
+        meta = json.loads(metrics_path.read_text())
+        have = {int(k) for k in meta.get("oof_accuracy_by_seed", {})}
+        problem = None
+        if not set(seeds) <= have:
+            problem = f"seeds {sorted(set(seeds) - have)} missing"
+        elif meta.get("folds") != folds:
+            problem = f"folds {meta.get('folds')} != {folds}"
+        elif list(meta.get("features", [])) != list(ACTIVE_FEATURES):
+            problem = f"features {meta.get('features')} != {ACTIVE_FEATURES}"
+        if problem:
+            print(f"Skipping {name}: {run_dir} does not match this run ({problem}); re-run `make tabpfn`")
+            continue
+
+        def aligned(path: Path, ids: pd.Series) -> np.ndarray:
+            frame = pd.read_csv(path).set_index("PassengerId")["prob"]
+            if set(ids) - set(frame.index):
+                raise ValueError(f"{path} lacks PassengerIds")
+            return frame.loc[ids].to_numpy(dtype=float)
+
+        found[name] = {
+            "oof": {s: aligned(run_dir / f"oof_seed{s}.csv", train["PassengerId"]) for s in seeds},
+            "test": aligned(run_dir / "test_probs.csv", test["PassengerId"]),
+            "version": meta.get("version"),
+        }
+    return found
 
 
-def accuracy(y: np.ndarray, probs: np.ndarray) -> float:
-    return float(((probs >= 0.5).astype(int) == y).mean())
-
-
-def fold_matrices(
-    fit: pd.DataFrame, others: list[pd.DataFrame], use_group: bool
-) -> tuple[pd.DataFrame, list[pd.DataFrame]]:
-    """Group features are computed from the fit labels only, then matrices are built."""
-    if use_group:
-        fit, others = add_group_features(fit, others)
-    return model_matrix(fit, use_group), [model_matrix(o, use_group) for o in others]
-
-
-def cross_validate(
-    names: list[str],
-    train: pd.DataFrame,
-    y: np.ndarray,
-    folds: int,
-    seed: int,
-    use_group: bool = True,
-    test: pd.DataFrame | None = None,
-) -> tuple[dict[str, np.ndarray], list[np.ndarray]]:
-    """`test` (label-free) only contributes to group sizes, never to label statistics."""
-    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
-    splits = [val for _, val in splitter.split(train, y)]
-    oof = {name: np.zeros(len(y)) for name in names}
-    for val_idx in splits:
-        train_idx = np.setdiff1d(np.arange(len(y)), val_idx)
-        others = [train.iloc[val_idx]] + ([test] if test is not None else [])
-        x_fit, (x_val, *_) = fold_matrices(train.iloc[train_idx], others, use_group)
-        for name in names:
-            model = make_model(name, seed, use_group).fit(x_fit, y[train_idx])
-            oof[name][val_idx] = model.predict_proba(x_val)[:, 1]
-    return oof, splits
+def load_embeddings(run_dir: Path, train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """emb_oof / emb_test of a modal_app run, reordered to the PassengerId order of train / test."""
+    run_dir = Path(run_dir)
+    ids = json.loads((run_dir / "emb_ids.json").read_text())
+    out = []
+    for file, key, frame in (("emb_oof.npy", "train_ids", train), ("emb_test.npy", "test_ids", test)):
+        arr = np.load(run_dir / file).astype(float)
+        order = {int(pid): i for i, pid in enumerate(ids[key])}
+        missing = set(frame["PassengerId"]) - set(order)
+        if missing or len(arr) != len(ids[key]):
+            raise ValueError(f"{run_dir}/{file} does not cover the {key} PassengerIds")
+        arr = arr[[order[int(pid)] for pid in frame["PassengerId"]]]
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{run_dir}/{file} contains NaN/inf")
+        out.append(arr)
+    return out[0], out[1]
 
 
 def pick_best(candidates: dict[str, np.ndarray], y: np.ndarray) -> str:
     return max(candidates, key=lambda name: accuracy(y, candidates[name]))
 
 
+def vote_names(ranked: list[str], top: int = 3) -> list[str]:
+    return ["avg:" + "+".join(ranked[:k]) for k in range(2, min(top, len(ranked)) + 1)]
+
+
 def add_averages(probs: dict[str, np.ndarray], y: np.ndarray, top: int = 3) -> dict[str, np.ndarray]:
     """Add soft-vote averages of the best 2 and best 3 single models (ranked by OOF accuracy)."""
     ranked = sorted(probs, key=lambda n: -accuracy(y, probs[n]))
     out = dict(probs)
-    for k in range(2, min(top, len(ranked)) + 1):
-        members = ranked[:k]
-        out["avg:" + "+".join(members)] = np.mean([probs[m] for m in members], axis=0)
+    for vote in vote_names(ranked, top):
+        out[vote] = np.mean([probs[m] for m in average_members(vote)], axis=0)
     return out
 
 
 def average_members(name: str) -> list[str]:
-    return name.removeprefix("avg:").split("+")
+    return re.split(r"\+(?!emb)", name.removeprefix("avg:"))  # "gb+emb+svc" -> gb+emb, svc
 
 
 def run(
@@ -269,55 +169,81 @@ def run(
     seed: int,
     extra_seeds: tuple[int, ...] = (),
     models: list[str] | None = None,
+    embeddings: Path | None = None,
+    precomputed_dir: Path | None = None,
 ) -> dict:
+    """Every candidate is cross-validated with split seed `seed` and each of `extra_seeds`
+    (`folds` folds each). Selection uses the mean accuracy over all seeds; oof.csv and
+    test_probs.csv come from split seed `seed`, which stays aligned with the LLM runs."""
     train_raw, test_raw = load_raw(data_dir)
     train, test = engineer(train_raw, test_raw)
     y = train["Survived"].to_numpy().astype(int)
+    emb = load_embeddings(embeddings, train, test) if embeddings else None
 
-    candidates = resolve_models(models)
-    oof, splits = cross_validate(candidates, train, y, folds, seed, test=test)
-    oof = add_averages(oof, y)
-    chosen = pick_best(oof, y)
+    candidates = resolve_models(models, with_emb=emb is not None)
+    seeds = [seed] + [s for s in extra_seeds if s != seed]
+    use_pre = precomputed_dir is not None and models is None and not os.environ.get("BASELINE_MODELS", "").strip()
+    pre = load_precomputed(precomputed_dir, seeds, train, test, folds) if use_pre else {}
+    pre = {n: v for n, v in pre.items() if n not in candidates}  # a locally fitted model wins
+    single: dict[int, dict[str, np.ndarray]] = {}
+    splits: list[np.ndarray] = []
+    for s in seeds:
+        single[s], split = cross_validate(candidates, train, y, folds, s, test=test, emb=emb)
+        if s == seed:
+            splits = split
+
+    def per_seed_acc(probs_by_seed: dict[int, np.ndarray]) -> list[float]:
+        return [accuracy(y, probs_by_seed[s]) for s in seeds]
+
+    probs: dict[str, dict[int, np.ndarray]] = {n: {s: single[s][n] for s in seeds} for n in candidates}
+    for n, item in pre.items():
+        probs[n] = dict(item["oof"])
+        for s in seeds:
+            single[s][n] = item["oof"][s]
+    ranked = sorted(probs, key=lambda n: -np.mean(per_seed_acc(probs[n])))
+    for vote in vote_names(ranked):
+        members = average_members(vote)
+        probs[vote] = {s: np.mean([single[s][m] for m in members], axis=0) for s in seeds}
+    accs = {n: per_seed_acc(p) for n, p in probs.items()}
+    chosen = max(accs, key=lambda n: np.mean(accs[n]))
     members = average_members(chosen) if chosen.startswith("avg:") else [chosen]
+    oof_chosen = probs[chosen][seed]
 
     # Final fit: group statistics from all train labels, applied to train (leave-one-out) and test.
-    x_train, (x_test,) = fold_matrices(train, [test], True)
-    test_probs = np.mean(
-        [make_model(n, seed).fit(x_train, y).predict_proba(x_test)[:, 1] for n in members], axis=0
-    )
-    test_by_model = {chosen: test_probs}
-
-    seed_oof = {seed: accuracy(y, oof[chosen])}
-    for other in extra_seeds:
-        other_oof, _ = cross_validate(members, train, y, folds, other, test=test)
-        seed_oof[other] = accuracy(y, np.mean([other_oof[n] for n in members], axis=0))
+    # Precomputed members (tabpfn / tabicl from Modal) bring their own test probabilities.
+    local_members = [n for n in members if n not in pre]
+    fitted = fit_predict_full(local_members, seed, train, y, test, emb=emb) if local_members else {}
+    member_probs = [fitted[n] if n in fitted else pre[n]["test"] for n in members]
+    test_probs = np.mean(member_probs, axis=0)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"PassengerId": train["PassengerId"], "prob": oof[chosen]}).to_csv(
-        out_dir / "oof.csv", index=False
-    )
-    pd.DataFrame({"PassengerId": test["PassengerId"], "prob": test_by_model[chosen]}).to_csv(
-        out_dir / "test_probs.csv", index=False
-    )
+    pd.DataFrame({"PassengerId": train["PassengerId"], "prob": oof_chosen}).to_csv(out_dir / "oof.csv", index=False)
+    pd.DataFrame({"PassengerId": test["PassengerId"], "prob": test_probs}).to_csv(out_dir / "test_probs.csv", index=False)
     metrics = {
         "model": f"baseline:{chosen}",
         "folds": folds,
         "seed": seed,
-        "oof_accuracy": accuracy(y, oof[chosen]),
-        "fold_accuracies": [accuracy(y[idx], oof[chosen][idx]) for idx in splits],
-        "candidate_oof_accuracy": {n: accuracy(y, p) for n, p in oof.items()},
+        "split_seed": seed,
+        "cv_seeds": seeds,
+        "features": list(ACTIVE_FEATURES),
+        "embeddings": str(embeddings) if embeddings else None,
+        "oof_accuracy": accuracy(y, oof_chosen),
+        "fold_accuracies": [accuracy(y[idx], oof_chosen[idx]) for idx in splits],
+        "candidate_oof_accuracy": {n: accs[n][0] for n in accs},
+        "candidate_cv_mean": {n: float(np.mean(a)) for n, a in accs.items()},
+        "candidate_cv_std": {n: float(np.std(a)) for n, a in accs.items()},
+        "chosen_oof_by_seed": {str(s): a for s, a in zip(seeds, accs[chosen])},
+        "chosen_oof_mean_over_seeds": float(np.mean(accs[chosen])),
+        "chosen_oof_std_over_seeds": float(np.std(accs[chosen])),
     }
     if "tabpfn" in candidates:
         metrics["tabpfn_version"] = tabpfn_version()
-    if extra_seeds:
-        metrics["chosen_oof_by_seed"] = {str(k): v for k, v in seed_oof.items()}
-        metrics["chosen_oof_mean_over_seeds"] = float(np.mean(list(seed_oof.values())))
+    if pre:
+        metrics["precomputed"] = {n: v["version"] for n, v in pre.items()}
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     submission_path = write_submission(
-        test["PassengerId"],
-        (test_by_model[chosen] >= 0.5).astype(int),
-        Path("submissions/baseline.csv"),
+        test["PassengerId"], (test_probs >= 0.5).astype(int), Path("submissions/baseline.csv")
     )
     validate_submission(submission_path, Path(data_dir) / "test.csv")
     return metrics
@@ -330,22 +256,38 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--check-seeds", type=int, nargs="*", default=[7, 123],
-        help="extra CV seeds used only to report the chosen model's OOF accuracy (default: 7 123)",
+        "--cv-seeds", default=",".join(map(str, DEFAULT_CV_SEEDS)),
+        help="comma-separated CV split seeds (each runs --folds folds); selection uses the mean, "
+        "oof.csv comes from --seed (default: 42,7,123)",
+    )
+    parser.add_argument(
+        "--precomputed-dir", type=Path, default=Path("outputs"),
+        help="where `make tabpfn` wrote tabpfn/ and tabicl/ (default: outputs); used only with the default candidate list",
+    )
+    parser.add_argument("--embeddings", type=Path, default=None, help="outputs/<run> with emb_oof.npy, emb_test.npy, emb_ids.json")
+    parser.add_argument(
+        "--features", default=None,
+        help=f"comma-separated optional feature groups ({','.join(FEATURE_GROUPS)}), 'none' or 'all'; default: {','.join(DEFAULT_FEATURES) or 'none'}",
     )
     parser.add_argument(
         "--models", nargs="*", default=None,
-        help=f"restrict candidates (default: BASELINE_MODELS env, else all of {' '.join(ALL_MODELS)})",
+        help=f"restrict candidates (default: BASELINE_MODELS env, else {' '.join(LOCAL_DEFAULT_MODELS)} plus any precomputed tabpfn/tabicl; "
+        "add tabpfn/tabicl here to fit them locally)",
     )
     load_env()
     args = parser.parse_args()
 
-    metrics = run(args.data_dir, args.out_dir, args.folds, args.seed, tuple(args.check_seeds), args.models)
-    print(f"Chosen: {metrics['model']}  OOF accuracy: {metrics['oof_accuracy']:.4f}")
+    if args.features is not None:
+        names = list(FEATURE_GROUPS) if args.features == "all" else [f for f in args.features.split(",") if f and f != "none"]
+        set_features(names)
+    cv_seeds = tuple(int(x) for x in args.cv_seeds.replace(",", " ").split())
+    metrics = run(args.data_dir, args.out_dir, args.folds, args.seed, cv_seeds, args.models, args.embeddings, args.precomputed_dir)
+    print(f"Chosen: {metrics['model']}  OOF accuracy (split seed {metrics['seed']}): {metrics['oof_accuracy']:.4f}")
+    print(f"  {'candidate':22s} seed{metrics['seed']}  mean over {metrics['cv_seeds']}  std")
     for name, acc in metrics["candidate_oof_accuracy"].items():
-        print(f"  {name:22s} {acc:.4f}")
-    if "chosen_oof_mean_over_seeds" in metrics:
-        print(f"Chosen model OOF by CV seed: {metrics['chosen_oof_by_seed']}  mean {metrics['chosen_oof_mean_over_seeds']:.4f}")
+        print(f"  {name:22s} {acc:.4f}  {metrics['candidate_cv_mean'][name]:.4f}  {metrics['candidate_cv_std'][name]:.4f}")
+    print(f"Chosen model OOF by CV seed: {metrics['chosen_oof_by_seed']}  mean {metrics['chosen_oof_mean_over_seeds']:.4f}"
+          f"  std {metrics['chosen_oof_std_over_seeds']:.4f}")
     print(f"Wrote {args.out_dir} and submissions/baseline.csv")
 
 
