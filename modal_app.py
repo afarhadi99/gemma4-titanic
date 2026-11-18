@@ -252,79 +252,32 @@ def prefetch_model(model_id: str) -> str:
     return path
 
 
-@app.function(
-    image=image,
-    gpu=DEFAULT_GPU,
-    timeout=60 * 60,
-    volumes={HF_HOME: hf_volume, RUNS_DIR: runs_volume},
-    secrets=[hf_secret],
-)
-def train_fold(
-    train_csv: str, test_csv: str, fold: int, folds: int, seed: int, cfg: dict
+def fit_and_score(
+    model,
+    tokenizer,
+    fit_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    cfg: dict,
+    device: str,
+    bf16: bool,
+    fold: int = 0,
+    seed: int = 42,
+    save_dir: str | None = None,
+    output_dir: str | None = None,
 ) -> dict:
-    """Train one LoRA fold (fold=-1 trains on all rows) and score val + test rows."""
+    """LoRA-fine-tune an already-loaded model on `fit_df`, then score `val_df` and `test_df`."""
     import inspect
+    import tempfile
 
     import torch
-    import transformers
     from peft import LoraConfig, get_peft_model
-    from sklearn.model_selection import StratifiedKFold
-    from transformers import AutoTokenizer, Trainer, TrainingArguments
+    from transformers import Trainer, TrainingArguments
 
-    from titanic.features import engineer
     from titanic.lora import select_lora_targets
     from titanic.text import LABEL_WORDS, QUESTION, SYSTEM_PROMPT, describe
 
-    hf_volume.reload()
-    if not os.environ.get("HF_TOKEN"):
-        print("WARNING: HF_TOKEN is empty (set it in .env); continuing without it")
-    transformers.set_seed(seed + max(fold, 0))
-    train_raw = pd.read_csv(io.StringIO(train_csv))
-    test_raw = pd.read_csv(io.StringIO(test_csv))
-    train_df, test_df = engineer(train_raw, test_raw)
-
-    if fold >= 0:
-        splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
-        tr_idx, va_idx = list(splitter.split(train_df, train_df["Survived"]))[fold]
-    else:
-        tr_idx, va_idx = np.arange(len(train_df)), np.array([], dtype=int)
-    fit_df = train_df.iloc[tr_idx]
-    val_df = train_df.iloc[va_idx]
-    print(f"[fold {fold}] fit={len(fit_df)} val={len(val_df)} test={len(test_df)}", flush=True)
-
-    model_id = cfg["model_id"]
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-    except Exception as exc:
-        print(f"AutoTokenizer failed ({exc!r}); falling back to AutoProcessor.tokenizer")
-        tokenizer = transformers.AutoProcessor.from_pretrained(model_id).tokenizer
-
-    model = None
-    attempts: list[str] = []
-    last_exc: Exception | None = None
-    for cls_name in MODEL_CLASS_NAMES:
-        model_cls = getattr(transformers, cls_name, None)
-        if model_cls is None:
-            attempts.append(f"{cls_name}: not available in this transformers version")
-            continue
-        for attn_label, attn in ATTN_CANDIDATES:
-            try:
-                model = model_cls.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation=attn)
-            except Exception as exc:
-                last_exc = exc
-                attempts.append(f"{cls_name} + {attn_label}: {type(exc).__name__}: {str(exc)[:160]}")
-                print(f"Load failed for {cls_name} + {attn_label}: {exc!r}", flush=True)
-                if not is_attention_error(exc):
-                    break  # unrelated error: move to the next model class, not another attention config
-                continue
-            print(f"Loaded with {cls_name} + attn_implementation={attn_label}", flush=True)
-            break
-        if model is not None:
-            break
-    if model is None:
-        raise RuntimeError(f"Could not load {model_id}. Tried: " + "; ".join(attempts)) from last_exc
-    model.to("cuda")
-    print(f"Loaded {type(model).__name__}", flush=True)
+    output_dir = output_dir or tempfile.mkdtemp(prefix=f"trainer-fold{fold}-")
 
     label_ids = []
     for word in LABEL_WORDS:
@@ -389,17 +342,18 @@ def train_fold(
     batch_size = cfg["batch_size"]
     max_steps = cfg["max_steps"]
     args = TrainingArguments(
-        output_dir=f"/tmp/trainer-fold{fold}",
+        output_dir=output_dir,
         per_device_train_batch_size=batch_size,
         learning_rate=cfg["lr"],
         num_train_epochs=cfg["epochs"],
         max_steps=max_steps if max_steps > 0 else -1,
         lr_scheduler_type="cosine",
         warmup_steps=warmup_steps_for(len(examples), batch_size, cfg["epochs"], max_steps),
-        bf16=True,
+        bf16=bf16,
         logging_steps=5,
-        save_strategy="none",
+        save_strategy="no",
         report_to="none",
+        use_cpu=(device == "cpu"),
         remove_unused_columns=False,
         label_names=["labels"],
         seed=seed + max(fold, 0),
@@ -415,8 +369,8 @@ def train_fold(
         size = cfg["eval_batch_size"]
         for start in range(0, len(prompts), size):
             chunk = prompts[start : start + size]
-            input_ids = pad_batch(chunk, pad_id).to("cuda")
-            attention_mask = pad_batch([[1] * len(c) for c in chunk], 0).to("cuda")
+            input_ids = pad_batch(chunk, pad_id).to(device)
+            attention_mask = pad_batch([[1] * len(c) for c in chunk], 0).to(device)
             extra = {k: torch.zeros_like(input_ids) for k in extra_zero_keys}
             logits = model(input_ids=input_ids, attention_mask=attention_mask, **extra).logits
             last = torch.tensor([len(c) - 1 for c in chunk], device=logits.device)
@@ -432,11 +386,10 @@ def train_fold(
     test_probs = score(encode_frame(test_df))
     print(f"[fold {fold}] val_accuracy={val_accuracy}", flush=True)
 
-    fold_dir = Path(RUNS_DIR) / cfg["run_name"] / ("full" if fold < 0 else f"fold{fold}")
-    fold_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(fold_dir)
-    tokenizer.save_pretrained(fold_dir)
-    runs_volume.commit()
+    if save_dir:
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
 
     return {
         "fold": fold,
@@ -446,6 +399,92 @@ def train_fold(
         "test_probs": test_probs,
         "val_accuracy": val_accuracy,
     }
+
+
+@app.function(
+    image=image,
+    gpu=DEFAULT_GPU,
+    timeout=60 * 60,
+    volumes={HF_HOME: hf_volume, RUNS_DIR: runs_volume},
+    secrets=[hf_secret],
+)
+def train_fold(
+    train_csv: str, test_csv: str, fold: int, folds: int, seed: int, cfg: dict
+) -> dict:
+    """Train one LoRA fold (fold=-1 trains on all rows) and score val + test rows."""
+    import torch
+    import transformers
+    from sklearn.model_selection import StratifiedKFold
+    from transformers import AutoTokenizer
+
+    from titanic.features import engineer
+    hf_volume.reload()
+    if not os.environ.get("HF_TOKEN"):
+        print("WARNING: HF_TOKEN is empty (set it in .env); continuing without it")
+    transformers.set_seed(seed + max(fold, 0))
+    train_raw = pd.read_csv(io.StringIO(train_csv))
+    test_raw = pd.read_csv(io.StringIO(test_csv))
+    train_df, test_df = engineer(train_raw, test_raw)
+
+    if fold >= 0:
+        splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+        tr_idx, va_idx = list(splitter.split(train_df, train_df["Survived"]))[fold]
+    else:
+        tr_idx, va_idx = np.arange(len(train_df)), np.array([], dtype=int)
+    fit_df = train_df.iloc[tr_idx]
+    val_df = train_df.iloc[va_idx]
+    print(f"[fold {fold}] fit={len(fit_df)} val={len(val_df)} test={len(test_df)}", flush=True)
+
+    model_id = cfg["model_id"]
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+    except Exception as exc:
+        print(f"AutoTokenizer failed ({exc!r}); falling back to AutoProcessor.tokenizer")
+        tokenizer = transformers.AutoProcessor.from_pretrained(model_id).tokenizer
+
+    model = None
+    attempts: list[str] = []
+    last_exc: Exception | None = None
+    for cls_name in MODEL_CLASS_NAMES:
+        model_cls = getattr(transformers, cls_name, None)
+        if model_cls is None:
+            attempts.append(f"{cls_name}: not available in this transformers version")
+            continue
+        for attn_label, attn in ATTN_CANDIDATES:
+            try:
+                model = model_cls.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation=attn)
+            except Exception as exc:
+                last_exc = exc
+                attempts.append(f"{cls_name} + {attn_label}: {type(exc).__name__}: {str(exc)[:160]}")
+                print(f"Load failed for {cls_name} + {attn_label}: {exc!r}", flush=True)
+                if not is_attention_error(exc):
+                    break  # unrelated error: move to the next model class, not another attention config
+                continue
+            print(f"Loaded with {cls_name} + attn_implementation={attn_label}", flush=True)
+            break
+        if model is not None:
+            break
+    if model is None:
+        raise RuntimeError(f"Could not load {model_id}. Tried: " + "; ".join(attempts)) from last_exc
+    model.to("cuda")
+    print(f"Loaded {type(model).__name__}", flush=True)
+
+    fold_dir = Path(RUNS_DIR) / cfg["run_name"] / ("full" if fold < 0 else f"fold{fold}")
+    result = fit_and_score(
+        model,
+        tokenizer,
+        fit_df,
+        val_df,
+        test_df,
+        cfg,
+        device="cuda",
+        bf16=True,
+        fold=fold,
+        seed=seed,
+        save_dir=str(fold_dir),
+    )
+    runs_volume.commit()
+    return result
 
 
 # --------------------------------------------------------------------------- #
