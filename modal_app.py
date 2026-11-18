@@ -56,7 +56,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
         "torch>=2.7",
-        "transformers>=5.5.2,<6",
+        "transformers>=5.5.2,<6",  # tested with 5.23.0
         "peft>=0.19.0",
         "accelerate>=1.12",
         "pandas",
@@ -75,6 +75,24 @@ hf_secret = modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
 # --------------------------------------------------------------------------- #
 # Pure helpers (no GPU libraries; unit tested in tests/test_modal_helpers.py)
 # --------------------------------------------------------------------------- #
+
+
+MODEL_CLASS_NAMES = ("AutoModelForCausalLM", "AutoModelForMultimodalLM")
+# Gemma 4 bundles an audio tower with no SDPA support in transformers 5.x, so keep SDPA
+# for text/vision and force eager for audio; plain "eager" is the last resort.
+ATTN_CANDIDATES: tuple[tuple[str, object], ...] = (
+    (
+        "sdpa(text,vision)+eager(audio)",
+        {"": "sdpa", "text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"},
+    ),
+    ("eager", "eager"),
+)
+
+
+def is_attention_error(exc: BaseException) -> bool:
+    """True when `exc` complains about the attention implementation (worth trying another one)."""
+    text = str(exc).lower()
+    return any(k in text for k in ("attn_implementation", "attention implementation", "scaled_dot_product"))
 
 
 def short_model_name(model_id: str) -> str:
@@ -251,7 +269,7 @@ def train_fold(
     import transformers
     from peft import LoraConfig, get_peft_model
     from sklearn.model_selection import StratifiedKFold
-    from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+    from transformers import AutoTokenizer, Trainer, TrainingArguments
 
     from titanic.features import engineer
     from titanic.lora import select_lora_targets
@@ -281,15 +299,30 @@ def train_fold(
         print(f"AutoTokenizer failed ({exc!r}); falling back to AutoProcessor.tokenizer")
         tokenizer = transformers.AutoProcessor.from_pretrained(model_id).tokenizer
 
-    load_kwargs = {"dtype": torch.bfloat16, "attn_implementation": "sdpa"}
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-    except Exception as exc:
-        fallback = getattr(transformers, "AutoModelForMultimodalLM", None)
-        if fallback is None:
-            raise
-        print(f"AutoModelForCausalLM failed ({exc!r}); falling back to AutoModelForMultimodalLM")
-        model = fallback.from_pretrained(model_id, **load_kwargs)
+    model = None
+    attempts: list[str] = []
+    last_exc: Exception | None = None
+    for cls_name in MODEL_CLASS_NAMES:
+        model_cls = getattr(transformers, cls_name, None)
+        if model_cls is None:
+            attempts.append(f"{cls_name}: not available in this transformers version")
+            continue
+        for attn_label, attn in ATTN_CANDIDATES:
+            try:
+                model = model_cls.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation=attn)
+            except Exception as exc:
+                last_exc = exc
+                attempts.append(f"{cls_name} + {attn_label}: {type(exc).__name__}: {str(exc)[:160]}")
+                print(f"Load failed for {cls_name} + {attn_label}: {exc!r}", flush=True)
+                if not is_attention_error(exc):
+                    break  # unrelated error: move to the next model class, not another attention config
+                continue
+            print(f"Loaded with {cls_name} + attn_implementation={attn_label}", flush=True)
+            break
+        if model is not None:
+            break
+    if model is None:
+        raise RuntimeError(f"Could not load {model_id}. Tried: " + "; ".join(attempts)) from last_exc
     model.to("cuda")
     print(f"Loaded {type(model).__name__}", flush=True)
 

@@ -87,3 +87,17 @@ def test_build_metrics():
     assert metrics["oof_accuracy"] == 1.0
     assert metrics["fold_accuracies"] == [1.0, 0.0]
     assert metrics["model_id"] == "google/gemma-4-E2B-it" and metrics["folds"] == 2
+
+
+def test_attn_candidates_order_and_shape():
+    labels = [label for label, _ in modal_app.ATTN_CANDIDATES]
+    assert labels[-1] == "eager" and modal_app.ATTN_CANDIDATES[-1][1] == "eager"
+    first = modal_app.ATTN_CANDIDATES[0][1]
+    assert first["audio_config"] == "eager" and first["text_config"] == "sdpa"
+    assert modal_app.MODEL_CLASS_NAMES[0] == "AutoModelForCausalLM"
+
+
+def test_is_attention_error():
+    msg = "Gemma4AudioModel does not support an attention implementation through torch.nn.functional.scaled_dot_product_attention yet"
+    assert modal_app.is_attention_error(ValueError(msg))
+    assert not modal_app.is_attention_error(OSError("401 gated repo"))
