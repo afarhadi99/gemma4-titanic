@@ -22,6 +22,11 @@ def test_short_model_name():
     assert modal_app.short_model_name("google/gemma-4-E2B-it") == "e2b"
     assert modal_app.short_model_name("google/gemma-4-26B-A4B-it") == "26b-a4b"
     assert modal_app.short_model_name("org/Other-Model") == "other-model"
+    assert modal_app.short_model_name("Qwen/Qwen3.5-2B") == "qwen3.5-2b"
+    assert modal_app.short_model_name("HuggingFaceTB/SmolLM3-3B") == "smollm3-3b"
+    assert modal_app.short_model_name("openbmb/MiniCPM5-2B") == "minicpm5-2b"
+    assert modal_app.short_model_name("ibm-granite/granite-4.2-3b") == "granite-4.2-3b"
+    assert modal_app.short_model_name("microsoft/Phi-4-mini-instruct") == "phi-4-mini"
 
 
 def test_default_run_name():
@@ -89,11 +94,15 @@ def test_build_metrics():
     assert metrics["model_id"] == "google/gemma-4-E2B-it" and metrics["folds"] == 2
 
 
-def test_attn_candidates_order_and_shape():
-    labels = [label for label, _ in modal_app.ATTN_CANDIDATES]
-    assert labels[-1] == "eager" and modal_app.ATTN_CANDIDATES[-1][1] == "eager"
-    first = modal_app.ATTN_CANDIDATES[0][1]
-    assert first["audio_config"] == "eager" and first["text_config"] == "sdpa"
+def test_attn_candidates_for_gemma_style_and_plain_configs():
+    from types import SimpleNamespace as NS
+
+    gemma = NS(text_config=NS(), vision_config=NS(), audio_config=NS())
+    cands = modal_app.attn_candidates(gemma)
+    assert [c[1] for c in (cands[0], cands[-1])] == ["sdpa", "eager"]
+    assert cands[1][1] == {"": "sdpa", "text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"}
+    plain = modal_app.attn_candidates(NS())
+    assert [c[1] for c in plain] == ["sdpa", "eager"]
     assert modal_app.MODEL_CLASS_NAMES[0] == "AutoModelForCausalLM"
 
 

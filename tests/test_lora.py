@@ -102,4 +102,41 @@ def test_raises_when_nothing_selected(modules):
 
 
 def test_proj_names_constant():
-    assert "q_proj" in LANGUAGE_PROJ_NAMES and len(LANGUAGE_PROJ_NAMES) == 7
+    assert "q_proj" in LANGUAGE_PROJ_NAMES and len(LANGUAGE_PROJ_NAMES) == len(set(LANGUAGE_PROJ_NAMES))
+
+
+def _layers(prefix, names, n_cls="Linear"):
+    return [(f"{prefix}.{n}", n_cls) for n in names]
+
+
+def test_qwen35_deltanet_and_full_attention():
+    lm = "model.language_model.layers"
+    modules = (
+        _layers(f"{lm}.0.linear_attn", ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"])
+        + _layers(f"{lm}.3.self_attn", ["q_proj", "k_proj", "v_proj", "o_proj"])
+        + _layers(f"{lm}.0.mlp", ["gate_proj", "up_proj", "down_proj"])
+        + [("model.visual.blocks.0.attn.qkv", "Linear"), ("model.visual.blocks.0.attn.proj", "Linear"),
+           ("model.visual.merger.linear_fc1", "Linear"), ("lm_head", "Linear")]
+    )
+    t = select_lora_targets(modules)
+    assert f"{lm}.0.linear_attn.in_proj_qkv" in t and f"{lm}.0.linear_attn.out_proj" in t
+    assert not any("in_proj_a" in x or "in_proj_b" in x or "visual" in x or "lm_head" in x for x in t)
+    assert len(t) == 10
+
+
+def test_smollm3_and_granite_plain_llama_names():
+    lm = "model.layers"
+    modules = _layers(f"{lm}.0.self_attn", ["q_proj", "k_proj", "v_proj", "o_proj"]) + _layers(
+        f"{lm}.0.mlp", ["gate_proj", "up_proj", "down_proj"]
+    ) + [("model.embed_tokens", "Embedding"), ("lm_head", "Linear")]
+    assert len(select_lora_targets(modules)) == 7
+
+
+def test_phi4_fused_names_and_multimodal_exclusions():
+    lm = "model.layers"
+    modules = _layers(f"{lm}.0.self_attn", ["qkv_proj", "o_proj"]) + _layers(f"{lm}.0.mlp", ["gate_up_proj", "down_proj"])
+    modules += [
+        ("model.embed_tokens_extend.audio_embed.encoder.layers.0.self_attn.out_proj", "Linear"),
+        ("model.embed_tokens_extend.image_embed.img_projection.0", "Linear"),
+    ]
+    assert select_lora_targets(modules) == sorted(n for n, _ in modules[:4])

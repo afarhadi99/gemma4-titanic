@@ -151,6 +151,16 @@ The Makefile targets work the same on Linux/macOS. On Windows PowerShell use `sc
 - More folds or other seeds: `--folds`, `--seed`, then ensemble the extra runs.
 - Average 2-3 Gemma runs with different `--seed`.
 - Try `--model-id google/gemma-4-E4B-it`.
+- Other models (same prompt, folds, epochs, lr and LoRA settings; only attention, label tokens, LoRA target names and chat-template kwargs adapt automatically):
+
+```bash
+make smoke MODEL=openbmb/MiniCPM5-2B
+make train MODEL=openbmb/MiniCPM5-2B
+make train-all MODELS="openbmb/MiniCPM5-2B ibm-granite/granite-4.2-3b LiquidAI/LFM3-1.7B"   # smoke + train each in turn, keeps going on failure
+make compare                                   # table of outputs/*: OOF, fold mean/std, log-loss, AUC
+```
+
+`LiquidAI/LFM3-1.7B` needs custom model code (`trust_remote_code`; license `lfm1.0`, not gated). It is the only repo enabled automatically (with a warning); for any other repo opt in with `TRUST_REMOTE_CODE=1` (or `--trust-remote-code`). MiniCPM5 and Granite use native transformers classes.
 
 ## Costs
 

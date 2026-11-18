@@ -12,9 +12,23 @@ LANGUAGE_PROJ_NAMES = (
     "gate_proj",
     "up_proj",
     "down_proj",
+    # Fused projections (Phi-3/4: qkv_proj, gate_up_proj).
+    "qkv_proj",
+    "gate_up_proj",
+    # Gated DeltaNet / linear-attention layers (Qwen3.5: in_proj_qkv, in_proj_z, out_proj;
+    # Qwen3-Next: in_proj_qkvz). The tiny in_proj_a / in_proj_b gate projections are skipped.
+    "in_proj_qkv",
+    "in_proj_qkvz",
+    "in_proj_z",
+    "out_proj",
+    # LFM3: SwiGLU MLP as w1 (gate) / w3 (up) / w2 (down), short-conv in_proj/out_proj.
+    "w1",
+    "w2",
+    "w3",
+    "in_proj",
 )
 
-_EXCLUDED_FRAGMENTS = ("vision", "audio", "multi_modal", "embed")
+_EXCLUDED_FRAGMENTS = ("vision", "visual", "audio", "speech", "multi_modal", "embed")
 
 
 def _is_excluded(segments: list[str]) -> bool:

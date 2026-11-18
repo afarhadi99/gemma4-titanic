@@ -1,4 +1,4 @@
-"""Fine-tune Gemma 4 with LoRA on Kaggle Titanic, on Modal GPUs.
+"""Fine-tune a small open LLM (default Gemma 4) with LoRA on Kaggle Titanic, on Modal GPUs.
 
 Each passenger is described in English; the model answers "yes"/"no" and the
 prediction is the softmax over those two label-token logits. K-fold training gives
@@ -7,12 +7,13 @@ out-of-fold (OOF) probabilities plus K test predictions that are averaged.
 Configuration comes from a single .env file in the repo root (see .env.example):
 MODAL_TOKEN_ID / MODAL_TOKEN_SECRET authenticate the local Modal client and HF_TOKEN is
 forwarded to the GPU containers. Optional defaults: GEMMA_MODEL_ID, MODAL_GPU, FOLDS,
-EPOCHS, LR, SEED. Command-line flags override them.
+EPOCHS, LR, SEED, TRUST_REMOTE_CODE. Command-line flags override them.
 
 Usage (run from the repo root, data in ./data):
     python -m modal run modal_app.py --smoke
     python -m modal run modal_app.py
     python -m modal run modal_app.py --model-id google/gemma-4-E4B-it --gpu A100-80GB --epochs 2
+    python -m modal run modal_app.py --model-id openbmb/MiniCPM5-2B
 
 Results land in outputs/<run-name>/{oof.csv,test_probs.csv,metrics.json}; adapters are
 saved to the `titanic-gemma4-runs` Modal volume under /runs/<run-name>/fold<k>/.
@@ -33,6 +34,15 @@ import numpy as np
 import pandas as pd
 
 from titanic.env import load_env
+from titanic.llm import (  # noqa: F401  (re-exported for tests)
+    MODEL_CLASS_NAMES,
+    attn_candidates,
+    chat_prompt,
+    resolve_trust_remote_code,
+    is_attention_error,
+    load_causal_lm,
+    pick_label_tokens,
+)
 
 if modal.is_local():
     load_env()
@@ -46,6 +56,7 @@ DEFAULT_FOLDS = int(os.environ.get("FOLDS") or 5)
 DEFAULT_EPOCHS = int(os.environ.get("EPOCHS") or 3)
 DEFAULT_LR = float(os.environ.get("LR") or 1e-4)
 DEFAULT_SEED = int(os.environ.get("SEED") or 42)
+DEFAULT_TRUST_REMOTE_CODE = (os.environ.get("TRUST_REMOTE_CODE") or "").lower() in ("1", "true", "yes")
 SMOKE_ROWS = 64
 SMOKE_FOLDS = 2
 SMOKE_MAX_STEPS = 10
@@ -56,7 +67,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
         "torch>=2.7",
-        "transformers>=5.5.2,<6",  # tested with 5.23.0
+        "transformers>=5.6,<6",  # tested with 5.23.0; MiniCPM5 needs >=5.6
         "peft>=0.19.0",
         "accelerate>=1.12",
         "pandas",
@@ -77,39 +88,24 @@ hf_secret = modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
 # --------------------------------------------------------------------------- #
 
 
-MODEL_CLASS_NAMES = ("AutoModelForCausalLM", "AutoModelForMultimodalLM")
-# Gemma 4 bundles an audio tower with no SDPA support in transformers 5.x, so keep SDPA
-# for text/vision and force eager for audio; plain "eager" is the last resort.
-ATTN_CANDIDATES: tuple[tuple[str, object], ...] = (
-    (
-        "sdpa(text,vision)+eager(audio)",
-        {"": "sdpa", "text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"},
-    ),
-    ("eager", "eager"),
-)
-
-
-def is_attention_error(exc: BaseException) -> bool:
-    """True when `exc` complains about the attention implementation (worth trying another one)."""
-    text = str(exc).lower()
-    return any(k in text for k in ("attn_implementation", "attention implementation", "scaled_dot_product"))
-
-
 def short_model_name(model_id: str) -> str:
-    """'google/gemma-4-E2B-it' -> 'e2b' (falls back to the lowercased last path segment)."""
+    """'google/gemma-4-E2B-it' -> 'e2b'; 'Qwen/Qwen3.5-2B' -> 'qwen3.5-2b';
+    'openbmb/MiniCPM5-2B' -> 'minicpm5-2b'; 'HuggingFaceTB/SmolLM3-3B' -> 'smollm3-3b'."""
     last = model_id.rsplit("/", 1)[-1].lower()
     parts = last.split("-")
     if len(parts) >= 3 and parts[0] == "gemma":
         core = [p for p in parts[2:] if p not in ("it", "pt")]
         if core:
             return "-".join(core)
-    return last
+    cleaned = [p for p in parts if p not in ("it", "instruct", "chat")]
+    return "-".join(cleaned) or last
 
 
 def default_run_name(model_id: str, now: datetime | None = None, smoke: bool = False) -> str:
     stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
     suffix = "-smoke" if smoke else ""
-    return f"gemma4-{short_model_name(model_id)}-{stamp}{suffix}"
+    family = "gemma4" if "gemma-4" in model_id.lower() else "lora"
+    return f"{family}-{short_model_name(model_id)}-{stamp}{suffix}"
 
 
 def build_messages(description: str, system_prompt: str, question: str) -> list[dict[str, str]]:
@@ -186,7 +182,7 @@ def build_metrics(
 ) -> dict:
     ordered = sorted(results, key=lambda r: r["fold"])
     return {
-        "model": f"gemma4-lora:{model_id}",
+        "model": f"llm-lora:{model_id}",
         "run_name": run_name,
         "model_id": model_id,
         "gpu": gpu,
@@ -217,6 +213,7 @@ def make_cfg(
     lora_dropout: float = 0.05,
     batch_size: int = 16,
     eval_batch_size: int = 16,
+    trust_remote_code: bool = False,
 ) -> dict:
     return {
         "model_id": model_id,
@@ -229,6 +226,7 @@ def make_cfg(
         "lora_dropout": lora_dropout,
         "batch_size": batch_size,
         "eval_batch_size": eval_batch_size,
+        "trust_remote_code": trust_remote_code,
     }
 
 
@@ -275,22 +273,16 @@ def fit_and_score(
     from transformers import Trainer, TrainingArguments
 
     from titanic.lora import select_lora_targets
-    from titanic.text import LABEL_WORDS, QUESTION, SYSTEM_PROMPT, describe
+    from titanic.text import QUESTION, SYSTEM_PROMPT, describe
 
     output_dir = output_dir or tempfile.mkdtemp(prefix=f"trainer-fold{fold}-")
 
-    label_ids = []
-    for word in LABEL_WORDS:
-        encoded = tokenizer.encode(word, add_special_tokens=False)
-        if len(encoded) != 1:
-            print(f"WARNING: label word {word!r} encodes to {encoded}; using the first token")
-        label_ids.append(encoded[0])
-    assert label_ids[0] != label_ids[1], f"Label tokens collide: {label_ids}"
-    print(f"Label token ids {dict(zip(LABEL_WORDS, label_ids))}", flush=True)
+    label_words, label_ids = pick_label_tokens(lambda w: tokenizer.encode(w, add_special_tokens=False))
+    print(f"Label tokens {dict(zip(label_words, label_ids))}", flush=True)
 
     def prompt_ids(row: pd.Series) -> list[int]:
         messages = build_messages(describe(row), SYSTEM_PROMPT, QUESTION)
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = chat_prompt(tokenizer, messages)
         return tokenizer(text, add_special_tokens=False)["input_ids"]
 
     def encode_frame(df: pd.DataFrame) -> list[list[int]]:
@@ -439,36 +431,16 @@ def train_fold(
     print(f"[fold {fold}] fit={len(fit_df)} val={len(val_df)} test={len(test_df)}", flush=True)
 
     model_id = cfg["model_id"]
+    trust = cfg.get("trust_remote_code", False)
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust)
     except Exception as exc:
         print(f"AutoTokenizer failed ({exc!r}); falling back to AutoProcessor.tokenizer")
-        tokenizer = transformers.AutoProcessor.from_pretrained(model_id).tokenizer
+        tokenizer = transformers.AutoProcessor.from_pretrained(model_id, trust_remote_code=trust).tokenizer
 
-    model = None
-    attempts: list[str] = []
-    last_exc: Exception | None = None
-    for cls_name in MODEL_CLASS_NAMES:
-        model_cls = getattr(transformers, cls_name, None)
-        if model_cls is None:
-            attempts.append(f"{cls_name}: not available in this transformers version")
-            continue
-        for attn_label, attn in ATTN_CANDIDATES:
-            try:
-                model = model_cls.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation=attn)
-            except Exception as exc:
-                last_exc = exc
-                attempts.append(f"{cls_name} + {attn_label}: {type(exc).__name__}: {str(exc)[:160]}")
-                print(f"Load failed for {cls_name} + {attn_label}: {exc!r}", flush=True)
-                if not is_attention_error(exc):
-                    break  # unrelated error: move to the next model class, not another attention config
-                continue
-            print(f"Loaded with {cls_name} + attn_implementation={attn_label}", flush=True)
-            break
-        if model is not None:
-            break
-    if model is None:
-        raise RuntimeError(f"Could not load {model_id}. Tried: " + "; ".join(attempts)) from last_exc
+    model, _ = load_causal_lm(
+        model_id, dtype=torch.bfloat16, trust_remote_code=cfg.get("trust_remote_code", False)
+    )
     model.to("cuda")
     print(f"Loaded {type(model).__name__}", flush=True)
 
@@ -506,6 +478,7 @@ def main(
     run_name: str = "",
     smoke: bool = False,
     seed: int = DEFAULT_SEED,
+    trust_remote_code: bool = DEFAULT_TRUST_REMOTE_CODE,
 ):
     start = time.time()
     data_path = Path(data_dir)
@@ -519,8 +492,16 @@ def main(
         folds, epochs, max_steps = SMOKE_FOLDS, 1, SMOKE_MAX_STEPS
         print(f"SMOKE: {SMOKE_ROWS} rows, {folds} folds, {epochs} epoch, max {max_steps} steps")
 
+    trust_remote_code = resolve_trust_remote_code(model_id, trust_remote_code)
     run_name = run_name or default_run_name(model_id, smoke=smoke)
-    cfg = make_cfg(model_id=model_id, run_name=run_name, epochs=epochs, lr=lr, max_steps=max_steps)
+    cfg = make_cfg(
+        model_id=model_id,
+        run_name=run_name,
+        epochs=epochs,
+        lr=lr,
+        max_steps=max_steps,
+        trust_remote_code=trust_remote_code,
+    )
     train_df = pd.read_csv(io.StringIO(train_text))
     test_df = pd.read_csv(io.StringIO(test_text))
     print(f"Run {run_name}: {model_id} on {gpu}, {folds} folds, {epochs} epochs, lr {lr}")
