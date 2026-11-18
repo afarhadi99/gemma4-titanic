@@ -142,6 +142,8 @@ Lessons:
 
 Selection rule: a variant is marked `candidate` only if its CV mean is at least the reference config's (same code path, same seeds) AND it differs from `REF` on 2-15 test passengers. We submit only candidates, and keep a new one only if its public score beats 0.80382. CV is a filter, not a proof: it did not predict the leaderboard before.
 
+Result on the real data (2026-11-18), with REF = the 0.80382 submission: **no candidates**. The best-CV variants (segment-only Gemma flips, 0.8451) make exactly the same test predictions as the 0.80382 file, and the large 3rd-class family rule changes 0 test passengers. The only variants that differ by more than one passenger are the rate-threshold ones, which score worse on CV (0.811-0.829). The 0.80382 file differs from pure WCG by a single passenger, the one Gemma flip that gained on the leaderboard. No further submissions were made: there was nothing new to test.
+
 Group features lifted Gemma from 0.8373 to 0.8496 OOF, but it still trails the classical vote, so the blend keeps the baseline alone. To make Gemma earn weight, average 2-3 Gemma runs with different `--seed` values or try `--model-id google/gemma-4-E4B-it`.
 
 OOF is the guide. The public leaderboard scores only about 209 passengers, so expect roughly 0.78-0.81 there; an honest 0.80+ is a strong score. Perfect 1.0 scores on the leaderboard come from looking up the public passenger list, not from modelling.
